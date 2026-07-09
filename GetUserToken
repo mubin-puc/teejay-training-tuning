@@ -1,0 +1,57 @@
+/****** Object:  StoredProcedure [auth].[GetUserToken]    Script Date: 7/9/2026 11:48:22 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [auth].[GetUserToken](
+    @emailAddress NVARCHAR(255) = NULL,
+    @token NVARCHAR(MAX) = NULL,
+    @userTokenType INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+
+    DECLARE @PersonTable TABLE (PersonID int);
+
+    IF @emailAddress IS NOT NULL
+        BEGIN
+            INSERT INTO @PersonTable (PersonID)
+            SELECT ID
+            FROM acct.Person
+            WHERE EmailAddress = @emailAddress
+        END
+
+    IF @token IS NOT NULL
+        BEGIN
+            INSERT INTO @PersonTable (PersonID)
+            SELECT PersonId
+            FROM auth.UserToken
+            where Token = @token
+        END
+
+
+    SELECT
+        ut.Id,
+        ut.Token,
+        ut.PersonId,
+        ut.EffectiveEndDate,
+        ut.Status,
+        p.EmailAddress [Person.EmailAddress],
+        ua.Id [Person.UserAuthentication.Id],
+        ua.Password [Person.UserAuthentication.Password],
+        ua.Salt [Person.UserAuthentication.Salt]
+    FROM @PersonTable t
+        JOIN acct.Person p on t.PersonID = p.id
+        JOIN auth.UserToken ut ON ut.PersonId = p.Id
+        LEFT JOIN auth.UserAuthentication ua ON p.Id = ua.PersonId
+    WHERE ut.Type = @userTokenType
+      AND ut.Status = 0 /* Valid */
+    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;
+END
+GO
+
+
