@@ -1,0 +1,113 @@
+/****** Object:  StoredProcedure [sf].[GetPrimaryContactsForFabric]    Script Date: 7/14/2026 11:28:01 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+CREATE PROCEDURE [sf].[GetPrimaryContactsForFabric]
+AS
+/********************************************************************************************************************
+
+Creator: Neha Ganatra
+
+Create Date: 13 March 2025
+
+Description: This procedure inserts data in Table 
+
+Sample:  Execute [sf].[GetPrimaryContactsForFabric]
+
+Change History
+Modified Date			Modified By			Description
+****************************************************************************************************************/
+
+
+    SET NOCOUNT ON;
+	-- Set TodayDate in Variable
+
+	DECLARE @TodayDateTime DATETIME;
+	SET @TodayDateTime = GETDATE();
+
+	DECLARE @CSTHourDiff INT 
+	SELECT @CSTHourDiff =  LEFT(current_utc_offset,3)  
+	FROM sys.time_zone_info 
+	WHERE Name = 'Central Standard Time'
+
+	DECLARE @CSTTime DATETIME
+	SELECT @CSTTime= DATEADD ( HOUR, @CSTHourDiff,@TodayDateTime)
+
+	DECLARE @FirstOfCurrentMonth DATETIME, @FirstOfNextMonth DATETIME 
+
+	SELECT @FirstOfCurrentMonth = DATETRUNC(MONTH, @CSTTime)
+
+	SELECT @FirstOfNextMonth  = DATEADD(d, 1, EOMONTH(@CSTTime))
+
+	--SELECT @FirstOfCurrentMonth, @FirstOfNextMonth
+
+	BEGIN
+
+
+	DROP TABLE IF EXISTS #NewPrimaryContactsCreatedDuringMonth
+	SELECT b.AccountId , b.PersonId , a.RowStart , a.RowEnd, a.FirstName,a.LastName ,a.DateOfBirth , a.AddressId
+	,a.EmailAddress , a.PhoneNumber
+	INTO #NewPrimaryContactsCreatedDuringMonth
+	FROM acct.Person a 
+		INNER JOIN acct.AccountPerson b 
+			ON b.PersonId = a.Id
+	--WHERE a.[RowStart] >= '1/1/2018' 
+	WHERE (a.[RowStart] >= @FirstOfCurrentMonth  AND a.[RowStart] < @FirstOfNextMonth)
+		AND b.AccountRoleId = 2
+		--AND  b.AccountId NOT IN (16258739,4307669,11295013,11295014,17199722,16258740)
+
+	--SELECT @FirstOfCurrentMonth  ,@FirstOfNextMonth
+	--SELECT * FROM #NewPrimaryContactsCreatedDuringMonth ORDER BY RowStart
+
+	 SELECT AccountId = a.AccountId, 
+					PersonId = a.PersonId,
+					FirstName = CASE  WHEN a.FirstName LIKE '%/%' THEN
+								REPLACE(a.FirstName, '/', '')
+								WHEN a.FirstName LIKE '%\%' THEN
+								REPLACE(a.FirstName, '\', '')
+								WHEN a.FirstName IS NULL THEN 'Customer'
+									WHEN a.FirstName = '' THEN 'Customer'
+									WHEN LEN(a.FirstName) = 0 THEN 'Customer'
+									ELSE a.FirstName END ,
+					
+					
+					LastName = CASE   WHEN a.LastName LIKE '%/%' THEN
+                          REPLACE(a.LastName, '/', '')
+                      WHEN a.LastName LIKE '%\%' THEN
+                          REPLACE(a.LastName, '\', '')
+					WHEN a.LastName IS NULL THEN 'Customer'
+									WHEN a.LastName = '' THEN 'Customer'
+									WHEN LEN(a.LastName) = 0 THEN 'Customer'
+									ELSE a.LastName END,
+					EmailAddress = CASE WHEN [dbo].[isValidEmailFormat](EmailAddress) = 1 THEN EmailAddress ELSE '' END,
+					PhoneNumber = a.PhoneNumber,
+					DateOfBirth = CASE WHEN  YEAR(a.DateOfBirth)< 1900 THEN '1/1/1900' ELSE a.DateOfBirth END ,
+					Country = b.Country,
+					StreetAddress = b.StreetAddress,
+					City = b.City,
+					State = b.State,
+					ZipCode = b.ZipCode,
+					[PrimaryContact] = 'True',
+					PersonRowStartDate = a.RowStart,
+					[PersonRowEndDate] = a.RowEnd,
+					[DataloadCreateDate_CST] = @CSTTime
+			 
+			 FROM #NewPrimaryContactsCreatedDuringMonth a
+				LEFT JOIN addr.Address b
+					ON b.Id = a.AddressId
+	
+
+
+  END 
+
+   
+
+GO
+
+
