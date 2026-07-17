@@ -1,0 +1,19 @@
+SELECT TOP (1000) [AccountId]
+      ,[PersonId]
+      ,[AccountRoleId]
+  FROM [acct].[AccountPerson]
+
+
+SELECT TOP (1000) [Id]
+      ,[Format]
+      ,[Country]
+      ,[StreetAddress]
+      ,[City]
+      ,[State]
+      ,[ZipCode]
+      ,[Owner]
+      ,[RowVer]
+      ,[RowStart]
+      ,[RowEnd]
+  FROM [addr].[Address]
+
