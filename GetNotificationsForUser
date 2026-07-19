@@ -1,0 +1,144 @@
+/****** Object:  StoredProcedure [notification].[GetNotificationsForUser]    Script Date: 7/19/2026 8:50:47 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [notification].[GetNotificationsForUser] (
+    @username NVARCHAR(64)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    /*
+    CORE-332 (follow-up to the 2026-06-17 outage). #1 CPU proc DB-wide pre-fix.
+    The per-user scope CTE and the inner chargeback EXISTS were both re-evaluated per
+    active notification (~29K) inside the correlated EXISTS, though neither depends on the
+    notification. Materialize each ONCE into a #temp and probe it. Output-identical
+    (FOR JSON unchanged); validated on a Prod-scale clone across 13 users covering every
+    branch (worst case 71.9s -> 3.4s). Uses existing index invoice.Payment.NCL_ExternalId_Incl.
+    */
+
+    CREATE TABLE #UserScope (
+        Id                    INT              NULL,
+        NotificationStartDate DATE             NULL,
+        BrandId               INT              NULL,
+        AurId                 INT              NULL,
+        LocationId            UNIQUEIDENTIFIER NULL
+    );
+
+    WITH CTE AS  /*Add Leon - 07/11/2025 - To improve performance*/
+    (
+      SELECT au.Id, NotificationStartDate,pk.BrandId ,aur.Id as aurId, aurl.LocationId
+      FROM  auth.AdminUsers au with(nolock)
+        LEFT JOIN auth.AdminUserRoleLocations aurl with(nolock)
+          ON au.Id = aurl.AdminUserId
+              AND aurl.Deleted IS NULL
+        LEFT JOIN park.Park pk with(nolock)
+          ON aurl.LocationId = pk.Id
+        LEFT JOIN auth.AdminUserRoles aur with(nolock)
+          ON au.Id = aur.AdminUserId
+              AND aur.Deleted IS NULL
+      WHERE au.Username = @username
+        AND au.Deleted IS NULL
+    
+      UNION
+    
+      SELECT au.Id, NotificationStartDate,aurb.BrandId , aur.Id as aurId, null
+      FROM  auth.AdminUsers au with(nolock)
+        LEFT JOIN auth.AdminUserRoleBrands aurb with(nolock)
+          ON au.Id = aurb.AdminUserId
+              AND aurb.Deleted IS NULL
+        LEFT JOIN auth.AdminUserRoles aur with(nolock)
+          ON au.Id = aur.AdminUserId
+              AND aur.Deleted IS NULL
+      WHERE au.Username = @username
+        AND au.Deleted IS NULL
+    )
+    INSERT INTO #UserScope (Id, NotificationStartDate, BrandId, AurId, LocationId)
+    SELECT Id, NotificationStartDate, BrandId, aurId, LocationId 
+    FROM CTE;
+
+    CREATE CLUSTERED INDEX IX_UserScope ON #UserScope (NotificationStartDate);
+
+    /* CORE-332: precompute the chargebacks that map to one of the user's locations, ONCE */
+    CREATE TABLE #LocationChargebacks (
+        ChargebackId INT              NOT NULL,
+        LocationId   UNIQUEIDENTIFIER NOT NULL
+    );
+
+    INSERT INTO #LocationChargebacks (ChargebackId, LocationId)
+    SELECT DISTINCT chbk.Id, ih1.LocationId
+    FROM invoice.Chargeback chbk with(nolock)
+        JOIN invoice.Payment py1 with(nolock)
+          ON py1.ExternalId = chbk.ExternalId
+        JOIN invoice.InvoiceHeader ih1 with(nolock)
+          ON ih1.Id = py1.InvoiceHeaderId
+        JOIN park.Park p1 with(nolock)
+          ON p1.Id = ih1.LocationId
+    WHERE EXISTS (SELECT 1 FROM #UserScope us WHERE us.LocationId = ih1.LocationId);
+
+    CREATE CLUSTERED INDEX IX_LocationChargebacks ON #LocationChargebacks (ChargebackId, LocationId);
+
+     SELECT CONVERT(NVARCHAR(MAX), (
+         SELECT
+             n.Id,
+             n.Title,
+             n.Body,
+             n.NotificationTypeId,
+             r.Version [Release.Version],
+             r.Id [Release.Id],
+             r.HasPdf [Release.HasPdf],
+             ri.ImageExtension [Release.ReleaseImage.ImageExtension],
+             chbk.Id [Chargeback.Id],
+             chbk.CreatedDate [Chargeback.CreatedDate]
+         FROM notification.Notification n with(nolock)
+          LEFT JOIN releases.Releases r with(nolock)
+              ON r.Id = n.ReleaseId
+          LEFT JOIN releases.ReleaseImages ri with(nolock)
+              ON r.ReleaseImageId = ri.Id
+          LEFT JOIN invoice.Chargeback chbk with(nolock)
+              ON n.ChargebackId = chbk.Id
+         WHERE (n.NotificationTypeId <> 1 /* Release */
+             OR r.HasPdf = 1)
+           AND (n.NotificationTypeId <> 3 OR chbk.Id IS NOT NULL) /* 3 - Chargeback */
+           AND n.Deleted IS NULL
+           AND NOT EXISTS ( /* Hasn't reviewed the notification */
+             SELECT TOP (1) 1
+             FROM auth.AdminUsers au with(nolock)
+              JOIN notification.UserNotification un with(nolock)
+                   ON un.AdminUserId = au.Id
+             WHERE au.Username = @username
+               AND au.Deleted IS NULL
+               AND un.NotificationId = n.Id
+          )
+          AND
+             EXISTS ( /* Notification is for after that user could receive notifications, and is within the users brands if release */
+                 SELECT TOP (1) 1
+                 FROM #UserScope au
+                  LEFT JOIN releases.ReleaseBrands rb with(nolock)
+                     ON rb.ReleaseId = r.Id  and rb.BrandId = au.BrandId
+                 WHERE au.NotificationStartDate <= CONVERT(DATE, n.CreatedDate)
+                   AND (
+                     (r.Id IS NULL AND chbk.Id IS NULL)
+                     OR aurId IS NOT NULL /* All brands */
+                     OR rb.Id is not null
+                     OR EXISTS ( /* Chargeback matches existing brand */
+                         SELECT top(1) 1
+                         FROM #LocationChargebacks lc
+                         WHERE lc.ChargebackId = chbk.Id
+                           AND lc.LocationId = au.LocationId
+                     )
+                 )
+             )
+         FOR JSON PATH
+     )) DATA;
+
+    DROP TABLE #LocationChargebacks;
+    DROP TABLE #UserScope;
+END
+GO
+
+
