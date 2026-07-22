@@ -1,0 +1,123 @@
+/****** Object:  StoredProcedure [sf].[UpsertChildContacts]    Script Date: 7/21/2026 5:16:05 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [sf].[UpsertChildContacts]
+/********************************************************************************************************************
+
+Creator: Neha Ganatra
+
+Create Date: 13 March 2025
+
+Description: This procedure inserts data in Table 
+
+Sample:  Execute sf.UpsertChildContacts
+
+Change History
+Modified Date			Modified By			Description
+****************************************************************************************************************/
+AS
+BEGIN TRY
+
+    SET NOCOUNT ON;
+	-- Set TodayDate in Variable
+
+	DECLARE @TodayDateTime DATETIME;
+    SET @TodayDateTime = GETDATE();
+
+	DECLARE @DeltaDate  [DATETIMEOFFSET] (7)
+	SELECT @DeltaDate = MAX(PersonRowStartDate) 
+	FROM [sf].[ChildContactPerson] WITH (NOLOCK)
+
+
+	IF @DeltaDate IS NULL 
+	BEGIN
+		SET @DeltaDate = '1/1/2018'
+	END 
+
+	-- Find New Records or Updated Records in Last 24 hours
+	DROP TABLE IF EXISTS #DeltaChildContacts
+	SELECT b.PersonId ,a.RowStart,AccountId
+	INTO #DeltaChildContacts
+	FROM acct.Person a
+		INNER JOIN acct.AccountPerson b
+			ON b.PersonId = a.Id
+	WHERE b.AccountRoleId <> 2 
+	AND a.RowStart > @DeltaDate
+	AND a.RowEnd >=  '12/31/9999'
+
+	DECLARE @RowInserted INT = 0
+	SELECT @RowInserted = COUNT (1) FROM #DeltaChildContacts
+--Insert into Primary Contact Information of New Account ------------------------
+	
+	IF @RowInserted = 0 
+	BEGIN
+		INSERT INTO[sf].[LogsChildContactPerson] ([CreatedOn],[CommandType],[RecordCount],[ErrorMessage])
+		SELECT [CreatedOn] = @TodayDateTime,
+			   [CommandType] = 'Record(s) Inserted',
+			   [RecordCount] = @RowInserted,
+			   [ErrorMessage]= 'No Error'
+	END 
+
+	 
+	IF @RowInserted > 0 
+	BEGIN
+			INSERT INTO [sf].[ChildContactPerson]
+			(AccountId, PersonId,FirstName, LastName,DateOfBirth,PersonRowStartDate,
+				PersonRowEndDate,DataloadCreateDate
+			)
+
+			SELECT AccountId = a.AccountId, 
+			PersonId = a.PersonId,
+			FirstName = CASE WHEN b.FirstName IS NULL THEN 'Customer'
+							WHEN b.FirstName = '' THEN 'Customer'
+							WHEN LEN(b.FirstName) = 0 THEN 'Customer'
+							ELSE b.FirstName END ,
+		 LastName = CASE WHEN b.LastName IS NULL THEN 'Customer'
+							WHEN b.LastName = '' THEN 'Customer'
+							WHEN LEN(b.LastName) = 0 THEN 'Customer'
+							ELSE b.LastName END,
+			 DateOfBirth = CASE WHEN  YEAR(b.DateOfBirth)< 1900 THEN '1/1/1900' ELSE b.DateOfBirth END 	,
+			PersonRowStartDate = b.RowStart,
+			[PersonRowEndDate] = b.RowEnd,
+			[DataloadCreateDate] = @TodayDateTime
+			FROM  #DeltaChildContacts a 
+				INNER JOIN acct.Person b
+						 ON b.Id = a.PersonId
+	
+				 
+		INSERT INTO [sf].[LogsChildContactPerson]  ([CreatedOn],[CommandType],[RecordCount],[ErrorMessage])
+		SELECT [CreatedOn] = @TodayDateTime,
+			   [CommandType] = 'Record(s) Inserted',
+			   [RecordCount] = @RowInserted,
+			   [ErrorMessage]= 'No Error'
+	   END 
+
+END TRY
+
+BEGIN CATCH
+    DECLARE @ErrorMessage NVARCHAR(4000),
+            @ErrorSeverity INT,
+            @ErrorState INT,
+            @ErrorNumber INT,
+            @ErrorLine INT;
+    SELECT @ErrorMessage = ERROR_MESSAGE(),
+           @ErrorSeverity = ERROR_SEVERITY(),
+           @ErrorState = ERROR_STATE(),
+           @ErrorNumber = ERROR_NUMBER(),
+           @ErrorLine = ERROR_LINE();
+    RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorNumber, @ErrorState, @ErrorLine);
+   
+
+    INSERT INTO[sf].[LogsChildContactPerson]  ([CreatedOn],[CommandType],[RecordCount],[ErrorMessage])
+    VALUES(@TodayDateTime,NULL, 0, @ErrorMessage);
+
+END CATCH;
+
+
+GO
+
+
