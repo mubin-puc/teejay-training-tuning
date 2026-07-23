@@ -1,0 +1,699 @@
+/****** Object:  StoredProcedure [report].[PaymentTransactionReport]    Script Date: 7/23/2026 5:13:05 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [report].[PaymentTransactionReport] (
+    @brandSlug NVARCHAR(25) = NULL,
+    @locationSlug NVARCHAR(30) = NULL,
+    @fromDate DATE,
+    @toDate DATE
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DROP TABLE IF EXISTS #payments;
+    DROP TABLE IF EXISTS #paymentPaymentReconciliationXRef;
+    DROP TABLE IF EXISTS #excludedAccounts;
+    DROP TABLE IF EXISTS #results;
+    DROP TABLE IF EXISTS #justiFiPayments;
+
+
+    CREATE TABLE #results (
+        Brand NVARCHAR(256),
+        Location NVARCHAR(256),
+        TransactionDate DATE,
+        DisbursementDate DATE,
+        BookingId INT,
+        IsRefund INT,
+        AccountId INT,
+        AccountHolder NVARCHAR(512),
+        Category NVARCHAR(64),
+        Product NVARCHAR(256),
+        ItemPrice DECIMAL(18, 6),
+        Discount DECIMAL(18, 6),
+        ZeeTax DECIMAL(18,6),
+        CorpFeeTax DECIMAL(18, 6),
+        CorpMembershipTax DECIMAL(18, 6),
+        TotalPrice AS ItemPrice + Discount + ZeeTax + CorpFeeTax + CorpMembershipTax,
+        RoyaltyRevenue DECIMAL(18, 6),
+        TransactionType NVARCHAR(64),
+        Provider NVARCHAR(64),
+        Source NVARCHAR(64),
+        ConfirmationCode CHAR(10),
+        InvoiceNumber INT,
+        PaymentId INT
+    );
+
+    CREATE TABLE #justiFiPayments (
+        PaymentId INT,
+        TransactionDate DATETIMEOFFSET,
+        DisbursementDate DATE,
+        PaymentChannelId INT,
+        InvoiceHeaderId INT,
+        PaymentOriginId INT,
+        IsDeposit BIT,
+        RefundedPaymentId INT,
+        Amount DECIMAL(18, 6)
+    );
+
+    CREATE TABLE #payments (
+        Brand            NVARCHAR(256)  NOT NULL,
+        Location         NVARCHAR(256)  NOT NULL,
+        PaymentId        INT            NOT NULL,
+        AccountId        INT            NOT NULL,
+        AccountHolder    NVARCHAR(256)  NOT NULL,
+        Category         NVARCHAR(16)   NOT NULL,
+        BookingId        INT            NULL,
+        ConfirmationCode CHAR(8)        NOT NULL,
+        InvoiceRefundId  INT            NULL,
+        IsRefund         BIT            NOT NULL,
+        TransactionType  NVARCHAR(16)   NOT NULL,
+        TransactionDate  DATE           NOT NULL,
+        DisbursementDate DATE           NULL,
+        PaymentAmount    DECIMAL(18, 6) NOT NULL
+        /* PaymentAmount(BOOKING_DEPOSIT) = Deposit - Fee - FeeTaxes */
+        /* PaymentAmount(BOOKING_BALANCE) = Payment */
+        /* PaymentAmount(NON-BOOKING) = Payment - Cart fees - cart fee taxes - membership taxes */
+    );
+
+    CREATE TABLE #paymentPaymentReconciliationXRef (
+        InvoiceId               INT            NOT NULL,
+        PaymentId               INT            NOT NULL,
+        PaymentReconciliationId INT            NOT NULL,
+        DisbursementDate        DATE           NOT NULL
+    );
+
+    CREATE TABLE #excludedAccounts (
+        AccountId INT NOT NULL PRIMARY KEY
+    );
+
+    /* Insert excluded accounts */
+    INSERT INTO #excludedAccounts (AccountId)
+    VALUES (5522), /* Jessie */
+           (79561), /* Peter */
+           (5071331), /* Peter */
+           (5262740); /* Jessie */
+
+    /* Insert into xref based on request id */
+    INSERT INTO #paymentPaymentReconciliationXRef (InvoiceId,
+                                                   PaymentId,
+                                                   PaymentReconciliationId,
+                                                   DisbursementDate)
+    SELECT pmt.InvoiceId,
+           pmt.Id,
+           pr.Id,
+           pr.DisbursementDate
+    FROM payment.PaymentReconciliation pr
+        JOIN payment.Payment pmt
+          ON pmt.RequestId = pr.RequestId
+    WHERE CONVERT(DATE, pmt.CreatedDate) BETWEEN @fromDate AND @toDate;
+
+    /* Insert into xref based on external id */
+    INSERT INTO #paymentPaymentReconciliationXRef (InvoiceId,
+                                                   PaymentId,
+                                                   PaymentReconciliationId,
+                                                   DisbursementDate)
+    SELECT pmt.InvoiceId,
+           pmt.Id,
+           pr.Id,
+           pr.DisbursementDate
+    FROM payment.PaymentReconciliation pr
+        JOIN payment.Payment pmt
+          ON pmt.ExternalId = pr.ExternalId
+    WHERE CONVERT(DATE, pmt.CreatedDate) BETWEEN @fromDate AND @toDate
+      AND NOT EXISTS(
+        SELECT 1
+        FROM #paymentPaymentReconciliationXRef pprxr
+        WHERE pprxr.PaymentId = pmt.Id
+          AND pprxr.PaymentReconciliationId = pr.Id
+    );
+
+    /* Booking Payments */
+    INSERT INTO #payments (
+        Brand,
+        Location,
+        PaymentId,
+        AccountId,
+        AccountHolder,
+        Category,
+        BookingId,
+        ConfirmationCode,
+        IsRefund,
+        TransactionType,
+        TransactionDate,
+        DisbursementDate,
+        PaymentAmount
+    )
+    SELECT
+        br.Name,
+        pk.Name,
+        p.Id,
+        act.Id,
+        CONCAT(pe.FirstName, ' ', pe.LastName),
+        'Booking',
+        bk.Id,
+        inv.ConfirmationCode,
+        0,
+        'Purchase',
+        CONVERT(DATE, p.CreatedDate),
+        pprxr.DisbursementDate,
+        CASE
+            WHEN p.IsDeposit = 1
+                THEN p.Amount - ISNULL(fl.Amount, 0)
+            ELSE p.Amount
+            END
+    FROM booking.Booking bk
+        JOIN payment.Invoice inv
+          ON bk.InvoiceId = inv.Id
+        JOIN payment.Payment p
+          ON inv.Id = p.InvoiceId
+        LEFT JOIN #paymentPaymentReconciliationXRef pprxr
+            ON pprxr.PaymentId = p.Id
+        JOIN acct.Account act
+          ON bk.AccountId = act.Id
+        JOIN acct.Person pe
+          ON act.PersonId = pe.Id
+        JOIN park.Park pk
+          ON bk.ParkId = pk.Id
+        JOIN dbo.Brands br
+          ON pk.BrandId = br.Id
+        LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Amount + li.Tax) Amount
+        FROM payment.LineItem li
+        WHERE li.ItemTypeId = 2 /* Fee */
+        GROUP BY li.InvoiceId
+    ) fl ON fl.InvoiceId = inv.Id
+    WHERE (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND CONVERT(DATE, p.CreatedDate) BETWEEN @fromDate AND @toDate
+      AND p.PaymentProviderId IN (2, 4) /* Braintree, Braintree handheld */
+      AND p.PaymentStatusId IN (2, 3) /* Submitted, settled */
+      AND p.Amount > 0
+      AND NOT EXISTS (
+        SELECT
+            1
+        FROM #excludedAccounts ea
+        WHERE bk.AccountId = ea.AccountId
+    );
+
+    /* Booking Refunds(Module) */
+    INSERT INTO #payments (
+        Brand,
+        Location,
+        PaymentId,
+        AccountId,
+        AccountHolder,
+        Category,
+        BookingId,
+        ConfirmationCode,
+        InvoiceRefundId,
+        IsRefund,
+        TransactionType,
+        TransactionDate,
+        DisbursementDate,
+        PaymentAmount
+    )
+    SELECT
+        br.Name,
+        pk.Name,
+        p.Id,
+        act.Id,
+        CONCAT(pe.FirstName, ' ', pe.LastName),
+        'Booking',
+        bk.Id,
+        rinv.ConfirmationCode,
+        ir.Id,
+        1,
+        'Refund',
+        CONVERT(DATE, p.CreatedDate),
+        rpprxr.DisbursementDate,
+        CASE
+            WHEN p.IsDeposit = 0 -- Balance Payment Refund
+                THEN p.Amount - ISNULL(rfli.Amount, 0)
+            ELSE
+                CASE
+                    WHEN ABS(p.Amount) = p.Amount --Full Refund of Deposit and Fee
+                        THEN p.Amount + ISNULL(ofli.Amount, 0)
+                    WHEN ABS(p.Amount) = bk.DepositPrice AND p.Amount < p.Amount -- Transaction Amount = Deposit and TransactionAmount < Payment Amount
+                        THEN p.Amount
+                    WHEN ABS(p.Amount) < bk.DepositPrice -- Transaction Amount < Deposit
+                        THEN p.Amount
+                    WHEN ABS(p.Amount) > bk.DepositPrice AND ABS(p.Amount) < p.Amount -- TransactionAmount > Deposit and Transaction Amount < Payment
+                        THEN -bk.DepositPrice
+                    ELSE p.Amount
+                    END
+            END
+    FROM booking.Booking bk
+     JOIN payment.InvoiceRefund ir
+          ON ir.InvoiceId = bk.InvoiceId
+     JOIN payment.Invoice rinv
+          ON ir.RefundInvoiceId = rinv.Id
+     JOIN payment.Payment p
+          ON ir.RefundPaymentId = p.Id
+     LEFT JOIN #paymentPaymentReconciliationXRef rpprxr
+               ON p.Id = rpprxr.PaymentId
+     JOIN acct.Account act
+          ON bk.AccountId = act.Id
+     JOIN acct.Person pe
+          ON act.PersonId = pe.Id
+     JOIN park.Park pk
+          ON bk.ParkId = pk.Id
+     JOIN dbo.Brands br
+          ON pk.BrandId = br.Id
+     LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Amount + li.Tax) Amount
+        FROM payment.LineItem li
+        WHERE li.ItemTypeId = 2 /* Fee */
+        GROUP BY li.InvoiceId
+    ) rfli ON rfli.InvoiceId = rinv.Id
+             LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Amount + li.Tax) Amount
+        FROM payment.LineItem li
+        WHERE li.ItemTypeId = 2 /* Fee */
+        GROUP BY li.InvoiceId
+    ) ofli ON ofli.InvoiceId = ir.InvoiceId
+    WHERE (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND CONVERT(DATE, p.CreatedDate) BETWEEN @fromDate AND @toDate
+      AND p.PaymentProviderId IN (2, 4) /* Braintree, Braintree handheld */
+      AND p.PaymentStatusId IN (2, 3) /* Submitted, settled */
+      AND NOT EXISTS (
+        SELECT
+            1
+        FROM #excludedAccounts ea
+        WHERE bk.AccountId = ea.AccountId
+    );
+
+    /* Non Booking Payments */
+    INSERT INTO #payments (
+        Brand,
+        Location,
+        PaymentId,
+        AccountId,
+        AccountHolder,
+        Category,
+        ConfirmationCode,
+        IsRefund,
+        TransactionType,
+        TransactionDate,
+        DisbursementDate,
+        PaymentAmount
+    )
+    SELECT
+        br.Name,
+        pk.Name,
+        p.Id,
+        act.Id,
+        CONCAT(pe.FirstName, ' ', pe.LastName),
+        'Non-Booking',
+        inv.ConfirmationCode,
+        0,
+        'Purchase',
+        CONVERT(DATE, p.CreatedDate),
+        pprxr.DisbursementDate,
+        p.Amount - ISNULL(fl.Amount, 0) - ISNULL(mli.Tax, 0)
+    FROM acct.AccountInvoices ai
+     JOIN payment.Invoice inv
+          ON ai.InvoiceId = inv.Id
+     JOIN payment.Payment p
+          ON p.InvoiceId = inv.Id
+     LEFT JOIN #paymentPaymentReconciliationXRef pprxr
+               ON p.Id = pprxr.PaymentId
+     JOIN acct.Account act
+          ON ai.AccountId = act.Id
+     JOIN acct.Person pe
+          ON act.PersonId = pe.Id
+     JOIN park.Park pk
+          ON ai.ParkId = pk.Id
+     JOIN dbo.Brands br
+          ON pk.BrandId = br.Id
+     LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Amount + li.Tax) Amount
+        FROM payment.LineItem li
+        WHERE li.ItemTypeId = 2 /* Fee */
+        GROUP BY li.InvoiceId
+    ) fl ON fl.InvoiceId = inv.Id
+             LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Tax) Tax
+        FROM payment.LineItem li
+         JOIN payment.LineItemSubscription lis
+              ON li.Id = lis.LineItemId
+         JOIN acct.Subscription s
+              ON lis.SubscriptionId = s.Id
+         JOIN prdct.ParkProduct pp
+              ON s.ProductId = pp.Id
+         JOIN prdct.ProductTemplate pt
+              ON pp.ProductTemplateId = pt.Id
+        WHERE pt.ProductTypeId IN (1, 7)/* Membership, Annual Pass */
+        GROUP BY li.InvoiceId
+    ) mli ON mli.InvoiceId = inv.Id
+    WHERE (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND CONVERT(DATE, p.CreatedDate) BETWEEN @fromDate AND @toDate
+      AND p.PaymentProviderId IN (2, 4) /* Braintree, Braintree handheld */
+      AND p.PaymentStatusId IN (2, 3) /* Submitted, settled */
+      AND NOT EXISTS (
+        SELECT
+            1
+        FROM #excludedAccounts ea
+        WHERE ai.AccountId = ea.AccountId
+    );
+
+    /* Non Booking Refunds */
+    INSERT INTO #payments (
+        Brand,
+        Location,
+        PaymentId,
+        AccountId,
+        AccountHolder,
+        Category,
+        ConfirmationCode,
+        InvoiceRefundId,
+        IsRefund,
+        TransactionType,
+        TransactionDate,
+        DisbursementDate,
+        PaymentAmount
+    )
+    SELECT
+        br.Name,
+        pk.Name,
+        p.Id,
+        act.Id,
+        CONCAT(pe.FirstName, ' ', pe.LastName),
+        'Non-Booking',
+        rinv.ConfirmationCode,
+        ir.Id,
+        1,
+        'Refund',
+        CONVERT(DATE, p.CreatedDate),
+        rpprxr.DisbursementDate,
+        p.Amount - ISNULL(fl.Amount, 0) - ISNULL(mi.Tax, 0)
+    FROM acct.AccountInvoices ai
+     JOIN payment.InvoiceRefund ir
+          ON ir.InvoiceId = ai.InvoiceId
+     JOIN payment.Invoice rinv
+          ON ir.RefundInvoiceId = rinv.Id
+     JOIN payment.Payment p
+          ON ir.RefundPaymentId = p.Id
+     LEFT JOIN #paymentPaymentReconciliationXRef rpprxr
+               ON p.Id = rpprxr.PaymentId
+     JOIN acct.Account act
+          ON ai.AccountId = act.Id
+     JOIN acct.Person pe
+          ON act.PersonId = pe.Id
+     JOIN park.Park pk
+          ON ai.ParkId = pk.Id
+     JOIN dbo.Brands br
+          ON pk.BrandId = br.Id
+     LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Amount + li.Tax) Amount
+        FROM payment.LineItem li
+        WHERE li.ItemTypeId = 2 /* Fee */
+        GROUP BY li.InvoiceId
+    ) fl ON fl.InvoiceId = rinv.Id
+             LEFT JOIN (
+        SELECT
+            li.InvoiceId,
+            SUM(li.Tax) Tax
+        FROM payment.LineItem li
+         JOIN payment.LineItemSubscription lis
+              ON li.Id = lis.LineItemId
+         JOIN acct.Subscription sub
+              ON lis.SubscriptionId = sub.Id
+         JOIN prdct.ParkProduct pp
+              ON sub.ProductId = pp.Id
+         JOIN prdct.ProductTemplate pt
+              ON pp.ProductTemplateId = pt.Id
+        WHERE pt.ProductTypeId IN (1, 7)/* Membership, Annual Pass */
+        GROUP BY li.InvoiceId
+    ) mi ON mi.InvoiceId = rinv.Id
+    WHERE (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND CONVERT(DATE, p.CreatedDate) BETWEEN @fromDate AND @toDate
+      AND p.PaymentProviderId IN (2, 4) /* Braintree, Braintree handheld */
+      AND p.PaymentStatusId IN (2, 3) /* Submitted, settled */
+      AND NOT EXISTS (
+        SELECT
+            1
+        FROM #excludedAccounts ea
+        WHERE ai.AccountId = ea.AccountId
+    );
+
+    INSERT INTO #justiFiPayments (PaymentId, TransactionDate, DisbursementDate, PaymentChannelId, InvoiceHeaderId, PaymentOriginId, IsDeposit, RefundedPaymentId, Amount)
+    SELECT
+        p.Id,
+        p.CreatedDate,
+        CONVERT(DATE, pp.AvailableOn),
+        p.PaymentChannelId,
+        p.InvoiceHeaderId,
+        p.PaymentOriginId,
+        p.IsDeposit,
+        p.RefundedPaymentId,
+        p.Amount
+    FROM invoice.Payment p 
+		JOIN invoice.InvoiceHeader ih 
+			ON p.InvoiceHeaderId = ih.Id
+		JOIN park.Park pk 
+			ON ih.LocationId = pk.Id 
+    LEFT JOIN invoice.PayoutPayment pp 
+      ON p.ExternalId = pp.PaymentId AND p.ExternalId like 'py_%'
+	WHERE CONVERT(DATE, p.CreatedDate AT TIME ZONE pk.Timezone) BETWEEN @fromDate AND @toDate
+      AND p.PaymentStatusId IN (2, 3); /* Authorized, Captured */
+
+
+    -- /* JustiFi Purchases */
+    INSERT INTO #results (Brand, Location, TransactionDate, DisbursementDate, BookingId, IsRefund, AccountId, AccountHolder, Category, Product, ItemPrice,
+                          Discount, ZeeTax, CorpFeeTax, CorpMembershipTax, TransactionType, Provider, Source, ConfirmationCode, InvoiceNumber, PaymentId, RoyaltyRevenue)
+    SELECT
+        br.Name,
+        pk.Name,
+        CONVERT(DATE, jfp.TransactionDate AT TIME ZONE pk.Timezone),
+        jfp.DisbursementDate,
+        ih.BookingId,
+        0, --IsRefund
+        ih.AccountId,
+        CONCAT(per.FirstName, ' ', per.LastName) AccountHolder,
+        CASE
+            WHEN ih.BookingId IS NOT NULL
+                THEN 'Booking'
+            ELSE 'Non-Booking'
+            END Category,
+        id.Description,
+        pid.PaidPrinciple,
+        COALESCE(disc.Discount, 0),
+        IIF((id.ProductFeeId IS NULL AND id.BookingFeeId IS NULL), pid.PaidTax + COALESCE(disc.DiscountTax, 0), 0),
+        IIF((id.ProductFeeId IS NULL AND id.BookingFeeId IS NULL), 0, pid.PaidTax + COALESCE(disc.DiscountTax, 0)),
+        0,
+        IIF(ih.RecurringBillingPeriodId IS NULL, 'Purchase', 'Recurring') TransactionType,
+        IIF(pc.Id = 5, 'Appetize', pc.Name) Provider, /* 5=PointOfSale */
+        CASE
+            WHEN ih.BookingId IS NOT NULL
+                THEN IIF(po.Id = 1, 'Online Booking', 'Admin Booking')
+            ELSE IIF(po.Id = 1, 'CC2', 'POS')
+            END, /* 1=Ecommerce */
+        CONCAT('J-', ih.ConfirmationCode),
+        ih.Id,
+        jfp.PaymentId,
+        IIF(id.BookingFeeId IS NOT NULL OR id.ProductFeeId IS NOT NULL, 0, pid.PaidPrinciple + COALESCE(disc.Discount, 0))
+    FROM invoice.InvoiceHeader ih
+     JOIN park.Park pk
+          ON ih.LocationId = pk.Id
+     JOIN dbo.Brands br
+          ON pk.BrandId = br.Id
+     JOIN #justiFiPayments jfp
+          ON jfp.InvoiceHeaderId = ih.Id
+     JOIN invoice.PaymentChannel pc
+          ON pc.Id = jfp.PaymentChannelId
+     JOIN acct.Account a
+          ON a.Id = ih.AccountId
+     JOIN acct.Person per
+          ON per.Id = a.PersonId
+     JOIN invoice.PaymentInvoiceDetail pid
+          ON pid.PaymentId = jfp.PaymentId
+              AND pid.PaymentInvoiceDetailStatusId = 1 /* Active */
+     JOIN invoice.InvoiceDetail id
+          ON id.Id = pid.InvoiceDetailId
+              AND id.InvoiceDetailStatusId = 1 /* Active */
+     LEFT JOIN acct.Subscription s
+               ON s.Id = id.SubscriptionId
+     LEFT JOIN prdct.ParkProduct pp
+               ON pp.Id = s.ProductId
+     LEFT JOIN prdct.ProductTemplate pt
+               ON pt.Id = pp.ProductTemplateId
+     LEFT JOIN prdct.ProductType t
+               ON t.Id = pt.ProductTypeId
+     JOIN invoice.PaymentOrigin po
+          ON po.Id = jfp.PaymentOriginId
+     LEFT JOIN (
+        SELECT
+            dd.RelatedInvoiceDetailId,
+            dpid.PaymentId,
+            SUM(dpid.PaidPrinciple) Discount,
+            SUM(dpid.PaidTax) DiscountTax
+        FROM invoice.InvoiceDetail dd
+                 JOIN invoice.PaymentInvoiceDetail dpid
+                      ON dpid.InvoiceDetailId = dd.Id
+        WHERE dd.InvoiceDetailStatusId = 1 /* Active */
+          AND dpid.PaymentInvoiceDetailStatusId = 1 /* Active */
+          AND dd.DetailTypeId = 3 /* Discount */
+        GROUP BY dd.RelatedInvoiceDetailId, dpid.PaymentId
+    ) disc ON disc.RelatedInvoiceDetailId = id.Id
+        AND disc.PaymentId = jfp.PaymentId
+    WHERE jfp.RefundedPaymentId IS NULL
+      AND (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM maintenance.AccountsToIgnore ati
+        WHERE ih.AccountId = ati.AccountId
+    )
+      AND pc.Id <> 6 /* None */
+      AND id.DetailTypeId <> 3 /* Discount */
+      AND id.ProductFeeId IS NULL AND id.BookingFeeId IS NULL
+      AND (pid.PaidTax <> 0 OR pid.PaidPrinciple <> 0);
+
+    -- /* JustiFi Refunds */
+    INSERT INTO #results (Brand, Location, TransactionDate, DisbursementDate, BookingId, IsRefund, AccountId, AccountHolder, Category, Product, ItemPrice,
+                          Discount, ZeeTax, CorpFeeTax, CorpMembershipTax, TransactionType, Provider, Source, ConfirmationCode, InvoiceNumber, PaymentId, RoyaltyRevenue)
+    SELECT
+        br.Name,
+        pk.Name,
+        rp.TransactionDate,
+        rp.DisbursementDate,
+        ih.BookingId,
+        1,
+        ih.AccountId,
+        CONCAT(per.FirstName, ' ', per.LastName) AccountHolder,
+        CASE
+            WHEN ih.BookingId IS NOT NULL
+                THEN 'Booking'
+            ELSE 'Non-Booking'
+            END Category,
+        id.Description,
+        ad.PrincipleAdjustment * ad.QuantityAdjustment,
+        0,
+        IIF(id.ProductFeeId IS NULL AND id.BookingFeeId IS NULL, ad.TaxAdjustment * ad.QuantityAdjustment, 0),
+        IIF(id.ProductFeeId IS NULL AND id.BookingFeeId IS NULL, 0, ad.TaxAdjustment * ad.QuantityAdjustment),
+        0,
+        'Refund',
+        IIF(pc.Id = 5, 'Appetize', pc.Name) Provider, /* 5=PointOfSale */
+        CASE
+            WHEN ih.BookingId IS NOT NULL
+                THEN IIF(po.Id = 1, 'Online Booking', 'Admin Booking')
+            ELSE IIF(po.Id = 1, 'CC2', 'POS')
+            END, /* 1=Ecommerce */
+        CONCAT('J-', ih.ConfirmationCode),
+        ih.Id,
+        rp.PaymentId,
+        IIF(id.BookingFeeId IS NOT NULL OR id.ProductFeeId IS NOT NULL, 0, ad.PrincipleAdjustment * ad.QuantityAdjustment)
+    FROM invoice.InvoiceHeader ih
+     JOIN invoice.AdjustmentInvoice ai
+          ON ih.Id = ai.InvoiceHeaderId
+     JOIN invoice.AdjustmentPayment ap
+          ON ai.Id = ap.AdjustmentInvoiceId
+     JOIN park.Park pk
+          ON pk.Id = ih.LocationId
+     JOIN dbo.Brands br
+          ON br.Id = pk.BrandId
+     JOIN #justiFiPayments rp
+          ON ap.PaymentId = rp.PaymentId
+     JOIN acct.Account ac
+          ON ih.AccountId = ac.Id
+     JOIN acct.Person per
+          ON ac.PersonId = per.Id
+     JOIN invoice.Payment op
+          ON op.Id = rp.RefundedPaymentId
+     JOIN invoice.AdjustmentDetail ad
+          ON ad.AdjustmentInvoiceId = ai.Id
+     JOIN invoice.InvoiceDetail id
+          ON ad.InvoiceDetailId = id.Id
+     LEFT JOIN acct.Subscription s
+               ON s.Id = id.SubscriptionId
+     LEFT JOIN prdct.ParkProduct pp
+               ON pp.Id = s.ProductId
+     LEFT JOIN prdct.ProductTemplate pt
+               ON pt.Id = pp.ProductTemplateId
+     LEFT JOIN prdct.ProductType t
+               ON t.Id = pt.ProductTypeId
+     JOIN invoice.PaymentOrigin po
+          ON po.Id = rp.PaymentOriginId
+     JOIN invoice.PaymentChannel pc
+          ON pc.Id = rp.PaymentChannelId
+    WHERE (@brandSlug IS NULL
+        OR br.UrlSlug = @brandSlug)
+      AND (@locationSlug IS NULL
+        OR pk.UrlSlug = @locationSlug)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM maintenance.AccountsToIgnore ati
+        WHERE ih.AccountId = ati.AccountId
+    )
+      AND pc.Id <> 6 /* None */
+      AND id.DetailTypeId <> 3; /* Discount */
+
+    SELECT
+        Brand,
+        Location,
+        AccountId,
+        AccountHolder,
+        Category,
+        BookingId,
+        ConfirmationCode,
+        InvoiceRefundId,
+        IsRefund,
+        TransactionType,
+        TransactionDate,
+        DisbursementDate,
+        PaymentAmount
+    FROM #payments p
+
+    UNION ALL
+
+    SELECT r.Brand
+         , r.Location
+         , r.AccountId
+         , r.AccountHolder
+         , r.Category
+         , r.BookingId
+         , r.ConfirmationCode
+         , NULL --InvoiceRefundId
+         , r.IsRefund
+         , r.TransactionType
+         , r.TransactionDate
+         , r.DisbursementDate
+         , SUM(r.TotalPrice)
+    FROM #results r
+    GROUP BY r.Brand, r.Location, r.AccountId, r.AccountHolder, r.Category, r.BookingId, r.ConfirmationCode
+           , r.IsRefund, r.TransactionType, r.TransactionDate, r.DisbursementDate
+    ORDER BY TransactionDate;
+END
+GO
+
+
