@@ -1,0 +1,196 @@
+/****** Object:  StoredProcedure [invoice].[GetInvoiceHeaderByConfirmationCode]    Script Date: 7/26/2026 9:53:37 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/* ============================================================================
+   invoice.GetInvoiceHeaderByConfirmationCode  —  REVISED (ORDER BY mitigation)
+   Purpose: force the InvoiceDetails JSON array to list subscription-bearing
+   details BEFORE null-subscription details (Fee / Discount / Tip), so the
+   cc-invoices ProcessMembershipAssignments loop consumes & removes every
+   membership assignment before it can reach a null-Subscription line.
+
+   Only difference vs _original.sql:
+     1. CREATE  ->  CREATE OR ALTER (for clean redeploy).
+     2. ADDED an ORDER BY to the InvoiceDetails sub-SELECT (marked "-- ADDED").
+   Result semantics are otherwise identical (same rows, same JSON shape).
+
+   NOTE: This is a mitigation, not the definitive fix. It removes the ordering-
+   dependent NullReferenceException for the common case (assignments are all
+   matched by subscription lines). It does NOT protect a cart that has MORE
+   membership assignments than matching subscription lines (a leftover
+   assignment keeps the list non-empty, so a trailing null line still throws).
+   The definitive fix is the null-guard in SubscriptionsService.cs (mirror the
+   existing guard at line 255). Deploy both.
+
+   Author: (produce-only; deploy by DBA/owner) — 2026-07-21
+   ============================================================================ */
+CREATE   PROCEDURE [invoice].[GetInvoiceHeaderByConfirmationCode](
+    @confirmationCode CHAR(8),
+    @accountId INT
+)
+AS
+BEGIN
+    SELECT CONVERT(NVARCHAR(MAX), (
+        SELECT
+            ih.Id,
+            ih.InvoiceStatusId,
+            ih.AccountId,
+            ih.Notes,
+            ih.TaxExemptId,
+            ih.BookingId,
+            ih.LocationId [InvoiceHeader.Location.Id],
+            b.Id [InvoiceHeader.Location.Brand.Id],
+            (
+                SELECT
+                    p.Id,
+                    p.ExternalId,
+                    p.CheckoutId,
+                    p.CardReaderId,
+                    p.IdempotencyKey,
+                    p.PaymentStatusId,
+                    p.FailureMessage,
+                    p.FailureReasonId,
+                    p.Amount,
+                    p.FeeAmount,
+                    p.PaymentChannelId,
+                    pm.LastFour [PaymentMethod.LastFour],
+                    p.IsDeposit,
+                    p.RemainingBalance
+                FROM invoice.Payment p
+                LEFT JOIN acct.PaymentMethod pm
+                    ON pm.Id = p.PaymentMethodId
+                WHERE p.InvoiceHeaderId = ih.Id
+                FOR JSON PATH
+            ) Payments,
+            (
+                SELECT
+                    id.UnitPrinciple,
+                    id.BundledItemPrinciple,
+                    id.ExternalId,
+                    id.UnitTax,
+                    id.Id,
+                    id.ProductFeeId,
+                    id.ItemFeeId,
+                    id.Description,
+                    id.Quantity,
+                    id.AdhocDiscountReasonId,
+                    id.DetailTypeId,
+                    id.RelatedInvoiceDetailId,
+                    id.TaxCode,
+                    id.IsTaxable,
+                    IIF(COALESCE(pp.IsCombo, 0) = 1, CAST(1 AS bit), CAST(0 AS bit)) AS IsComboItem,
+                    s.Id [Subscription.Id],
+                    s.ProductId [Subscription.ProductId],
+                    s.TicketId [Subscription.TicketId],
+                    s.UpgradedFromSubscriptionId [Subscription.UpgradedFromSubscriptionId],
+                    pp.Name [Subscription.ParkProduct.Name],
+                    ppl.WebColor [Subscription.ParkProduct.ProductLevel.WebColor],
+                    pt.ProductTypeId [Subscription.ParkProduct.ProductTemplate.ProductTypeId],
+                    pt.BillingInterval [Subscription.ParkProduct.ProductTemplate.BillingInterval],
+                    pt.ValidFromOffset [Subscription.ParkProduct.ProductTemplate.ValidFromOffset],
+                    pt.ExpirationTypeId [Subscription.ParkProduct.ProductTemplate.ExpirationTypeId],
+                    pt.ValidToOffset [Subscription.ParkProduct.ProductTemplate.ValidToOffset],
+                    t.Name [Subscription.Ticket.Name],
+                    tpl.WebColor [Subscription.Ticket.ProductLevel.WebColor],
+                    per.FirstName [Subscription.Person.FirstName],
+                    per.LastName [Subscription.Person.LastName],
+                    (
+                        SELECT
+                            pid.PaymentId,
+                            pid.InvoiceDetailId,
+                            pid.PaidPrinciple,
+                            pid.PaidTax
+                        FROM invoice.PaymentInvoiceDetail pid
+                            JOIN invoice.Payment p ON pid.PaymentId = p.Id
+                        WHERE pid.InvoiceDetailId = id.Id
+                            AND p.InvoiceHeaderId = ih.Id
+                            AND ih.AccountId = @accountId
+                            AND pid.PaymentInvoiceDetailStatusId = 1 /* Active */
+                        FOR JSON PATH
+                    ) PaymentInvoiceDetails
+                FROM invoice.InvoiceDetail id
+                LEFT JOIN acct.Subscription s
+                    ON s.Id = id.SubscriptionId
+                LEFT JOIN prdct.ParkProduct pp
+                    ON s.ProductId = pp.Id
+                LEFT JOIN prdct.ProductLevel ppl
+                    ON ppl.Id = pp.ProductLevelId
+                LEFT JOIN prdct.ProductTemplate pt
+                    ON pt.Id = pp.ProductTemplateId
+                LEFT JOIN product.Ticket t
+                    ON s.TicketId = t.Id
+                LEFT JOIN prdct.ProductLevel tpl
+                    ON tpl.Id = t.ProductLevelId
+                LEFT JOIN acct.Person per
+                    ON per.Id = s.PersonId
+                WHERE id.InvoiceHeaderId = ih.Id
+                    AND id.InvoiceDetailStatusId = 1 /* Active */
+                -- [CORE-406] Order subscription-bearing lines first, null-subscription lines
+                -- (Fee/Discount/Tip) last, so the cc-invoices ProcessMembershipAssignments loop clears
+                -- every assignment before it reaches a null-Subscription line. Backport of the PROD
+                -- ORDER BY mitigation (hand-applied 2026-07-21); makes the assignment order-independent.
+                ORDER BY
+                    CASE WHEN id.SubscriptionId IS NULL THEN 1 ELSE 0 END,
+                    id.Id
+                FOR JSON PATH
+            ) InvoiceDetails,
+            (
+                SELECT
+                    s.Id [Subscription.Id],
+                    s.ProductId [Subscription.ProductId],
+                    s.TicketId [Subscription.TicketId],
+                    s.PersonId [Subscription.PersonId],
+                    s.AccountId [Subscription.AccountId],
+                    1 [Subscription.Quantity],
+                    pp.Name [Subscription.ParkProduct.Name],
+                    ppl.WebColor [Subscription.ParkProduct.ProductLevel.WebColor],
+                    t.Name [Subscription.Ticket.Name],
+                    tpl.WebColor [Subscription.Ticket.ProductLevel.WebColor],
+                    per.FirstName [Subscription.Person.FirstName],
+                    per.LastName [Subscription.Person.LastName],
+                    IIF(COALESCE(pp.IsCombo, 0) = 1, CAST(1 AS bit), CAST(0 AS bit)) AS IsComboItem
+                FROM invoice.InvoiceRedemptionDetail ird
+                JOIN acct.Subscription s
+                    ON s.Id = ird.SubscriptionId
+                LEFT JOIN prdct.ParkProduct pp
+                    ON s.ProductId = pp.Id
+                LEFT JOIN prdct.ProductLevel ppl
+                    ON ppl.Id = pp.ProductLevelId
+                LEFT JOIN prdct.ProductTemplate pt
+                    ON pt.Id = pp.ProductTemplateId
+                LEFT JOIN product.Ticket t
+                    ON s.TicketId = t.Id
+                LEFT JOIN prdct.ProductLevel tpl
+                    ON tpl.Id = t.ProductLevelId
+                LEFT JOIN acct.Person per
+                    ON per.Id = s.PersonId
+                WHERE ih.Id = ird.InvoiceHeaderId
+                FOR JSON PATH
+            ) InvoiceRedemptionDetails,
+            (
+                SELECT
+				    per.Id,
+                    per.FirstName,
+					per.LastName
+                FROM invoice.InvoiceHeaderParticipant ihp
+				JOIN acct.Person per
+                    ON per.Id = ihp.ParticipantID
+                WHERE ihp.InvoiceHeaderId = ih.Id
+                FOR JSON PATH
+            ) SelfServiceInvoiceParticipants
+        FROM invoice.InvoiceHeader ih
+            LEFT JOIN park.Park pp
+                ON ih.LocationId = pp.Id
+            LEFT JOIN dbo.Brands b
+                ON pp.BrandId = b.Id
+        WHERE ih.ConfirmationCode = @confirmationCode
+            AND ih.AccountId = @accountId
+        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+    )) DATA
+END
+GO
+
+
