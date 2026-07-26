@@ -1,0 +1,41 @@
+/****** Object:  StoredProcedure [events].[GetEnrolledAccountsByScheduleDetail]    Script Date: 7/26/2026 9:56:27 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [events].[GetEnrolledAccountsByScheduleDetail](
+    @franchiseScheduleDetailId INT = NULL,
+    @franchiseScheduleId INT = NULL,
+    @franchiseScheduleExclusionId INT = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @franchiseScheduleExclusionId IS NOT NULL
+        SELECT @franchiseScheduleDetailId = FranchiseScheduleDetailId
+        FROM events.FranchiseScheduleExclusions
+        WHERE Id = @franchiseScheduleExclusionId;
+
+    SELECT (
+        SELECT DISTINCT
+            s.AccountId,
+            s.PersonId
+        FROM events.EventReservations er
+        JOIN acct.Subscription s
+            ON er.SubscriptionId = s.Id
+        JOIN events.FranchiseScheduleDetails fsd
+            ON er.FranchiseScheduleDetailId = fsd.Id
+        WHERE (@franchiseScheduleDetailId IS NOT NULL AND er.FranchiseScheduleDetailId = @franchiseScheduleDetailId
+            OR @franchiseScheduleId IS NOT NULL AND fsd.FranchiseScheduleId = @franchiseScheduleId)
+          AND er.Canceled IS NULL
+          AND s.AccountId IS NOT NULL
+          AND s.PersonId IS NOT NULL
+        FOR JSON PATH
+    );
+END
+GO
+
+
