@@ -1,0 +1,193 @@
+/****** Object:  StoredProcedure [invoice].[GetPayment]    Script Date: 7/28/2026 1:53:00 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [invoice].[GetPayment] (
+    @paymentId INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT CONVERT(NVARCHAR(MAX), (
+        SELECT p.Id,
+               p.InvoiceHeaderId,
+               p.ExternalId,
+               p.CheckoutId,
+               p.CardReaderId,
+               p.IdempotencyKey,
+               p.Amount,
+               p.FeeAmount,
+               p.PaymentStatusId,
+               p.PaymentChannelId,
+               p.PaymentMethodId,
+               p.PaymentOriginId,
+               p.SubAccountId,
+               p.RefundedPaymentId,
+               p.RemainingBalance,
+               p.FailureReasonId,
+               p.FailureMessage,
+               p.CreatedBy,
+               p.CreatedDate,
+               p.ModifiedBy,
+               p.ModifiedDate,
+               p.IsDeposit,
+               p.ApplicationFeeTotal,
+               pm.Id [PaymentMethod.Id],
+               pm.ExternalId [PaymentMethod.ExternalId],
+               pm.LastFour [PaymentMethod.LastFour],
+               pm.PaymentMethodTypeId [PaymentMethod.PaymentMethodTypeId],
+               p.InvoiceHeaderId [InvoiceHeader.Id],
+               ih.LocationId [InvoiceHeader.Location.Id],
+               b.Id [InvoiceHeader.Location.Brand.Id],
+               (
+                   SELECT ai.Id,
+                          (
+                             SELECT ap.Id,
+                                    ap.PaymentId [Payment.Id],
+                                    app.Amount [Payment.Amount],
+                                    app.FeeAmount [Payment.FeeAmount],
+                                    app.ApplicationFeeTotal [Payment.ApplicationFeeTotal],
+                                    refundPayment.Id [Payment.RefundedPayment.Id],
+                                    (
+                                        SELECT
+                                            afd.Id,
+                                            afd.UnitTax,
+                                            afd.UnitPrinciple,
+                                            afd.ApplicationFeeTypeId
+                                        FROM invoice.ApplicationFeeDetail afd
+                                        WHERE afd.PaymentId = ap.PaymentId
+                                        FOR JSON PATH
+                                   ) [Payment.ApplicationFeeDetails]
+                             FROM invoice.AdjustmentPayment ap
+                                JOIN invoice.Payment app
+                                    ON ap.PaymentId = app.Id
+                                JOIN invoice.Payment refundPayment
+                                    ON app.RefundedPaymentId = refundPayment.Id
+                             WHERE ap.AdjustmentInvoiceId = ai.Id
+                                AND app.RefundedPaymentId = @paymentId
+                             FOR JSON PATH
+                          ) [AdjustmentPayments],
+                          (
+                             SELECT ad.Id,
+                                    ad.PrincipleAdjustment,
+                                    ad.TaxAdjustment,
+                                    ad.QuantityAdjustment,
+                                    adid.Id [InvoiceDetail.Id],
+                                    adid.UnitPrinciple [InvoiceDetail.UnitPrinciple],
+                                    adid.UnitTax [InvoiceDetail.UnitTax],
+                                    adid.Quantity [InvoiceDetail.Quantity]
+                             FROM invoice.AdjustmentDetail ad
+                                JOIN invoice.InvoiceDetail adid
+                                    ON ad.InvoiceDetailId = adid.Id
+                             WHERE ad.AdjustmentInvoiceId = ai.Id
+                                 AND adid.InvoiceDetailStatusId = 1 /* Active */
+                                 AND EXISTS(
+                                     SELECT 1
+                                     FROM invoice.AdjustmentPayment ap
+                                     JOIN invoice.Payment rp
+                                         ON rp.Id = ap.PaymentId
+                                     WHERE ap.AdjustmentInvoiceId = ad.AdjustmentInvoiceId
+                                         AND rp.PaymentStatusId IN (2, 3) /* Authorized, Captured */
+                                         AND rp.RefundedPaymentId = p.Id
+                                )
+                             FOR JSON PATH
+                          ) [AdjustmentDetails]
+                   FROM invoice.AdjustmentInvoice ai
+                   WHERE InvoiceHeaderId = p.InvoiceHeaderId
+                   FOR JSON PATH
+               ) [InvoiceHeader.AdjustmentInvoices],
+               (
+                    SELECT id.Id,
+                           id.Description,
+                           id.DetailTypeId,
+                           id.UnitPrinciple,
+                           id.UnitTax,
+                           id.Quantity,
+                           id.RelatedInvoiceDetailId,
+                           id.ProductFeeId,
+                           id.BookingFeeId
+                    FROM invoice.InvoiceDetail id
+                    WHERE id.InvoiceHeaderId = p.InvoiceHeaderId
+                        AND (
+                            id.RelatedInvoiceDetailId IS NULL
+                            OR id.SubscriptionId IS NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM invoice.InvoiceDetail parentId
+                                JOIN acct.Subscription s ON s.Id = parentId.SubscriptionId
+                                JOIN product.Bundle bu ON s.BundleId = bu.Id
+                                WHERE parentId.Id = id.RelatedInvoiceDetailId
+                                    AND parentId.InvoiceHeaderId = p.InvoiceHeaderId
+                                    AND bu.BundleTypeId = 1 /* ECommerce */
+                            )
+                        )
+                        AND id.InvoiceDetailStatusId = 1 /* Active */
+                    FOR JSON PATH
+               ) [InvoiceHeader.InvoiceDetails],
+               (
+                    SELECT pid.Id,
+                           pid.PaidTax,
+                           pid.PaidPrinciple,
+                           pid.PaymentId [Payment.Id],
+                           pidid.Id [InvoiceDetail.Id],
+                           pidid.Description [InvoiceDetail.Description],
+                           pidid.DetailTypeId [InvoiceDetail.DetailTypeId],
+                           pidid.UnitPrinciple [InvoiceDetail.UnitPrinciple],
+                           pidid.UnitTax [InvoiceDetail.UnitTax],
+                           pidid.Quantity [InvoiceDetail.Quantity],
+                           pidid.RelatedInvoiceDetailId [InvoiceDetail.RelatedInvoiceDetailId],
+                           pidid.ProductFeeId [InvoiceDetail.ProductFeeId],
+                           pidid.BookingFeeId [InvoiceDetail.BookingFeeId],
+                           pidid.ItemFeeId [InvoiceDetail.ItemFeeId]
+                    FROM invoice.PaymentInvoiceDetail pid
+                        JOIN invoice.InvoiceDetail pidid
+                            ON pid.InvoiceDetailId = pidid.Id
+                    WHERE pid.PaymentId = @paymentId
+                        AND (
+                            pidid.RelatedInvoiceDetailId IS NULL
+                            OR pidid.SubscriptionId IS NULL
+                            OR EXISTS (
+                                SELECT 1
+                                FROM invoice.InvoiceDetail parentId
+                                JOIN acct.Subscription s ON s.Id = parentId.SubscriptionId
+                                JOIN product.Bundle bu ON s.BundleId = bu.Id
+                                WHERE parentId.Id = pidid.RelatedInvoiceDetailId
+                                    AND parentId.InvoiceHeaderId = p.InvoiceHeaderId
+                                    AND bu.BundleTypeId = 1 /* ECommerce */
+                            )
+                        )
+                        AND pidid.InvoiceDetailStatusId = 1 /* Active */
+                        AND pid.PaymentInvoiceDetailStatusId = 1 /* Active */
+                        AND (pid.PaidPrinciple <> 0 OR pid.PaidTax <> 0)
+                    FOR JSON PATH
+               ) [PaymentInvoiceDetails],
+               (
+                    SELECT
+                        afd.Id,
+                        afd.UnitTax,
+                        afd.UnitPrinciple,
+                        afd.ApplicationFeeTypeId
+                    FROM invoice.ApplicationFeeDetail afd
+                    WHERE afd.PaymentId = @paymentId
+                    FOR JSON PATH
+               ) ApplicationFeeDetails
+        FROM invoice.Payment p
+        LEFT JOIN acct.PaymentMethod pm
+            ON p.PaymentMethodId = pm.Id
+        LEFT JOIN invoice.InvoiceHeader ih
+            ON p.InvoiceHeaderId = ih.Id
+        LEFT JOIN park.Park pp
+            ON ih.LocationId = pp.Id
+        LEFT JOIN dbo.Brands b
+            ON pp.BrandId = b.Id
+        WHERE p.Id = @paymentId
+        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+    ));
+END
+GO
+
+
