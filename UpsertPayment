@@ -1,0 +1,231 @@
+/****** Object:  StoredProcedure [invoice].[UpsertPayment]    Script Date: 7/28/2026 1:47:42 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [invoice].[UpsertPayment](
+    @paymentId INT = NULL,
+    @payment NVARCHAR(MAX),
+    @paymentInvoiceDetails NVARCHAR(MAX) = NULL,
+    @applicationFeeDetails NVARCHAR(MAX) = NULL,
+    @changeUser NVARCHAR(256)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRANSACTION;
+    BEGIN TRY
+        -- step 1: payment
+        -- step 1.1: new payment
+        IF ISNULL(@paymentId, 0) = 0
+          BEGIN
+            INSERT INTO invoice.Payment (InvoiceHeaderId, ExternalId, CheckoutId, CardReaderId, IdempotencyKey, Amount, FeeAmount, ApplicationFeeTotal,
+                PaymentStatusId, PaymentChannelId, PaymentMethodId, PaymentOriginId, SubAccountId, IsDeposit, IsHardDecline, CreatedBy,
+                CreatedDate, ModifiedBy, ModifiedDate,RemainingBalance)
+            SELECT
+                i.InvoiceHeaderId,
+                i.ExternalId,
+                i.CheckoutId,
+                i.CardReaderId,
+                i.IdempotencyKey,
+                i.Amount,
+                i.FeeAmount,
+                i.ApplicationFeeTotal,
+                i.PaymentStatusId,
+                i.PaymentChannelId,
+                i.PaymentMethodId,
+                i.PaymentOriginId,
+                i.SubAccountId,
+                i.IsDeposit,
+                i.IsHardDecline,
+                @changeUser,
+                SYSDATETIMEOFFSET(),
+                @changeUser,
+                SYSDATETIMEOFFSET(),
+                i.RemainingBalance
+            FROM OPENJSON(@payment)
+                WITH (
+                    InvoiceHeaderId INT,
+                    ExternalId NVARCHAR(64),
+                    CheckoutId NVARCHAR(64),
+                    CardReaderId NVARCHAR(64),
+                    IdempotencyKey UNIQUEIDENTIFIER,
+                    Amount DECIMAL(18, 6),
+                    FeeAmount DECIMAL(18, 6),
+                    ApplicationFeeTotal DECIMAL(18, 6),
+                    PaymentStatusId INT,
+                    PaymentChannelId INT,
+                    PaymentMethodId INT,
+                    PaymentOriginId INT,
+                    SubAccountId INT,
+                    IsDeposit BIT,
+                    IsHardDecline BIT,
+                    RemainingBalance DECIMAL(18, 6)
+                ) i
+            SET @paymentId = SCOPE_IDENTITY();
+            
+            -- no invoice detail handling here??
+            -- (because this SP will be called multiple times during a payment and the first/create call will not pass in invoice detail)
+          END
+        ELSE
+          BEGIN
+            -- step 1.2: existing payment
+            -- step 1.2.1: update payment
+            UPDATE invoice.Payment
+            SET
+                ExternalId = u.ExternalId,
+                CheckoutId = u.CheckoutId,
+                CardReaderId = u.CardReaderId,
+                Amount = u.Amount,
+                FeeAmount = u.FeeAmount,
+                ApplicationFeeTotal = u.ApplicationFeeTotal,
+                PaymentStatusId = u.PaymentStatusId,
+                PaymentChannelId = u.PaymentChannelId,
+                PaymentMethodId = u.PaymentMethodId,
+                FailureReasonId = u.FailureReasonId,
+                FailureMessage = u.FailureMessage,
+                IsDeposit = u.IsDeposit,
+                IsHardDecline = u.IsHardDecline,
+                ModifiedDate = SYSDATETIMEOFFSET(),
+                ModifiedBy   = @changeUser,
+                RemainingBalance = u.RemainingBalance
+            FROM OPENJSON(@payment)
+                WITH (
+                    ExternalId NVARCHAR(64),
+                    CheckoutId NVARCHAR(64),
+                    CardReaderId NVARCHAR(64),
+                    IdempotencyKey UNIQUEIDENTIFIER,
+                    Amount DECIMAL(18, 6),
+                    FeeAmount DECIMAL(18, 6),
+                    ApplicationFeeTotal DECIMAL(18, 6),
+                    PaymentStatusId INT,
+                    PaymentChannelId INT,
+                    PaymentMethodId INT,
+                    PaymentOriginId INT,
+                    SubAccountId INT,
+                    FailureReasonId INT,
+                    FailureMessage NVARCHAR(256),
+                    IsDeposit BIT,
+                    IsHardDecline BIT,
+                    RemainingBalance DECIMAL(18, 6)
+                ) u
+            WHERE Id = @paymentId;
+
+            -- step 1.2.2: invoice detail for existing payment
+            IF (@paymentInvoiceDetails IS NOT NULL)
+              BEGIN
+                INSERT INTO invoice.PaymentInvoiceDetail (PaymentId, InvoiceDetailId, PaidPrinciple, PaidTax,
+                PaymentInvoiceDetailStatusId, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate)
+                SELECT
+                    i.PaymentId,
+                    i.InvoiceDetailId,
+                    i.PaidPrinciple,
+                    i.PaidTax,
+                    1, /* Active */
+                    @changeUser,
+                    SYSDATETIMEOFFSET(),
+                    @changeUser,
+                    SYSDATETIMEOFFSET()
+                FROM OPENJSON(@paymentInvoiceDetails)
+                WITH (
+                    PaymentId INT,
+                    InvoiceDetailId INT,
+                    PaidPrinciple DECIMAL(18, 6),
+                    PaidTax DECIMAL(18, 6)
+                ) i
+                WHERE NOT EXISTS (
+                    SELECT TOP 1 1
+                    FROM invoice.PaymentInvoiceDetail pid
+                    WHERE pid.PaymentId = i.PaymentId
+                        AND pid.InvoiceDetailId = i.InvoiceDetailId
+                        AND pid.PaymentInvoiceDetailStatusId = 1 /* Active */
+                )
+              END
+          END
+
+        -- Step 2: application fee
+        IF (@applicationFeeDetails IS NOT NULL)
+          BEGIN
+            -- Step 2.1: existing fee detail
+            UPDATE afd
+            SET afd.UnitPrinciple = u.UnitPrinciple,
+                afd.UnitTax = u.UnitTax,
+                afd.ModifiedBy = @changeUser,
+                afd.ModifiedDate = SYSDATETIMEOFFSET()
+            FROM invoice.ApplicationFeeDetail afd
+            JOIN OPENJSON(@applicationFeeDetails)
+            WITH (
+                ApplicationFeeTypeId INT,
+                UnitPrinciple DECIMAL(18, 6),
+                UnitTax DECIMAL(18, 6)
+            ) u ON afd.ApplicationFeeTypeId = u.ApplicationFeeTypeId
+            WHERE afd.PaymentId = @paymentId
+                AND EXISTS (
+                    SELECT TOP 1 1
+                    FROM invoice.ApplicationFeeDetail afd WITH (nolock)
+                    WHERE afd.PaymentId = @paymentId
+                        AND afd.ApplicationFeeTypeId = u.ApplicationFeeTypeId
+                );
+
+            -- Step 2.2: new fee detail
+            INSERT INTO invoice.ApplicationFeeDetail (PaymentId, ApplicationFeeTypeId, UnitPrinciple, UnitTax,
+                CreatedBy, CreatedDate, ModifiedBy, ModifiedDate)
+            SELECT
+                @paymentId,
+                i.ApplicationFeeTypeId,
+                i.UnitPrinciple,
+                i.UnitTax,
+                @changeUser,
+                SYSDATETIMEOFFSET(),
+                @changeUser,
+                SYSDATETIMEOFFSET()
+            FROM OPENJSON(@applicationFeeDetails)
+            WITH (
+                ApplicationFeeTypeId INT,
+                UnitPrinciple DECIMAL(18, 6),
+                UnitTax DECIMAL(18, 6)
+            ) i
+            WHERE NOT EXISTS (
+                SELECT TOP 1 1
+                FROM invoice.ApplicationFeeDetail afd WITH (nolock)
+                -- neither afd.PaymentId nor afd.ApplicationFeeTypeId has index (6.5m rows, 100ms)
+                WHERE afd.PaymentId = @paymentId
+                    AND afd.ApplicationFeeTypeId = i.ApplicationFeeTypeId
+            )
+          END
+
+        -- CORE-336: reconcile Payment.ApplicationFeeTotal with the sum of its ApplicationFeeDetail rows.
+        -- The async Canada payment.succeeded webhook backfills the processing fee (and recomputes the total)
+        -- after this proc may have written the app-supplied total (0 for v2); without this, whichever writes
+        -- last wins and the webhook's value can be clobbered. Raising the stored total to the itemized sum
+        -- makes the result order-independent. Only raises (never lowers) and is a no-op when already correct.
+        -- Sums all ApplicationFeeTypeId values (no filter), matching invoice.UpsertPaymentFeeDetail.
+        IF EXISTS (SELECT 1 FROM invoice.ApplicationFeeDetail WHERE PaymentId = @paymentId)
+        BEGIN
+            DECLARE @feeSum DECIMAL(18, 6) = (
+                SELECT ISNULL(SUM(UnitPrinciple + UnitTax), 0)
+                FROM invoice.ApplicationFeeDetail
+                WHERE PaymentId = @paymentId    -- no filter based on ApplicationFeeTypeId
+            );
+
+            UPDATE invoice.Payment
+            SET ApplicationFeeTotal = @feeSum
+            WHERE Id = @paymentId
+                AND ApplicationFeeTotal < @feeSum;
+        END
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+    COMMIT TRANSACTION;
+
+    -- Step 3: return the payment (100ms)
+    EXEC invoice.GetPayment @paymentId;
+END
+GO
+
+
