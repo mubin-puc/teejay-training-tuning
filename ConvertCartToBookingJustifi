@@ -1,0 +1,885 @@
+/****** Object:  StoredProcedure [booking].[ConvertCartToBookingJustifi]    Script Date: 7/28/2026 1:58:37 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [booking].[ConvertCartToBookingJustifi](
+    @cookieId UNIQUEIDENTIFIER,
+    @accountId INT = NULL,
+    @modifiedBy NVARCHAR(256),
+    @rowVer TIMESTAMP = NULL,
+    @depositPrice DECIMAL(18,6) = NULL,
+    @invoiceHeaderId INT = NULL,
+    @accountEntitlementId INT = NULL,
+    @clearPartyHost BIT = 0
+)
+AS
+BEGIN
+    BEGIN TRY
+    BEGIN TRAN;
+
+    DECLARE @bookingId INT,
+        @cartId INT,
+        @parkId UNIQUEIDENTIFIER,
+        @personId INT,
+        @markFeesAsPaid BIT = 0;
+
+    SELECT TOP (1) @bookingId = c.BookingId,
+                   @cartId = c.Id,
+                   @parkId = c.ParkId
+    FROM booking.Cart c
+    WHERE c.CookieId = @cookieId
+    ORDER BY c.BookingId;
+
+    SELECT @personId = ap.PersonId
+    FROM acct.AccountPerson ap
+    WHERE ap.AccountId = @accountId
+      AND ap.AccountRoleId = 2 /* Primary */
+
+    IF @cartId IS NULL
+        BEGIN
+            ROLLBACK TRAN;
+            THROW 52000, 'Record not found', 16;
+        END;
+
+    DROP TABLE IF EXISTS #invoiceDetails;
+    DROP TABLE IF EXISTS #bookingDiscount;
+
+    CREATE TABLE #invoiceDetails (
+        ExternalId NVARCHAR(64),
+        BookingItemId INT NULL,
+        BookingParticipantId INT NULL,
+        BookingFeeId INT NULL
+    );
+
+    CREATE TABLE #bookingDiscount (
+        BookingId INT NULL,
+        InvoiceDetailId INT NULL,
+        Amount DECIMAL(18, 6),
+        IsPercentage BIT NULL,
+        Description NVARCHAR(256) NULL,
+        AccountEntitlementId INT,
+        PromotionId INT NULL,
+        CreatedBy NVARCHAR(256) NULL,
+        CreatedDate DATETIMEOFFSET NULL,
+        ModifiedBy NVARCHAR(256) NULL,
+        ModifiedDate DATETIMEOFFSET NULL,
+    );
+
+    /* If booking has been finalized/ no show/ deleted or cancelled */
+    IF @bookingId IS NOT NULL AND EXISTS (
+    SELECT b.Paid
+    FROM booking.Booking b
+    WHERE b.Id = @bookingId
+        AND (
+            b.Paid IS NOT NULL
+            OR b.NoShow IS NOT NULL
+            OR b.Canceled IS NOT NULL
+            OR b.Deleted IS NOT NULL
+            )
+    )
+    BEGIN
+        THROW 52000, 'This booking has already been finalized.', 16;
+    END
+
+    /* If booking does not exist */
+    IF @bookingId IS NULL
+        BEGIN
+            /* Create booking */
+            INSERT INTO booking.Booking
+            (ParkId,
+             AccountId,
+             ScheduleDetailId,
+             ProductLevelId,
+             RequiresHandicap,
+             DepositPrice,
+             HasProtectionPlan,
+             InternalNotes,
+             ExternalNotes,
+             Booked,
+             CreatedBy,
+             CreatedDate,
+             ModifiedBy,
+             ModifiedDate,
+             IsSpecialEvent,
+             PromotionId,
+             IsAI)
+            SELECT c.ParkId,
+                   @accountId,
+                   c.ScheduleDetailId,
+                   t.ProductLevelId,
+                   c.RequiresHandicap,
+                   COALESCE(@depositPrice, b.DepositPrice, pk.BookingDepositAmount),
+                   0,
+                   InternalNotes,
+                   ExternalNotes,
+                   SYSDATETIME(),
+                   c.CreatedBy,
+                   c.CreatedDate,
+                   c.CreatedBy,
+                   SYSDATETIMEOFFSET(),
+                   0,
+                   c.PromotionId,
+                   c.IsAI
+            FROM booking.Cart c
+            JOIN product.BundleSchedule bs
+                 ON c.BaseBundleScheduleId = bs.Id
+            JOIN product.Bundle b
+                 ON bs.BundleId = b.Id
+            JOIN park.Park pk
+                 ON c.ParkId = pk.Id
+            OUTER APPLY (
+                SELECT TOP 1
+                    t.ProductLevelId
+                FROM product.BundleProduct bp
+                JOIN product.Ticket t
+                    ON bp.TicketId = t.Id
+                WHERE b.Id = bp.BundleId
+            ) t
+            WHERE c.CookieId = @cookieId;
+
+            SET @bookingId = SCOPE_IDENTITY();
+
+            /* Insert GuestsOfHonor */
+            INSERT INTO booking.BookingGuestOfHonor
+            (BookingId,
+             FirstName,
+             LastName,
+             DateOfBirth)
+            SELECT @bookingId,
+                   cgoh.FirstName,
+                   cgoh.LastName,
+                   cgoh.DateOfBirth
+            FROM booking.CartGuestOfHonor cgoh
+            WHERE CartId = @cartId;
+
+            /* Insert BookingItemFees */
+            INSERT INTO booking.BookingFee
+            (
+                    BookingId,
+                    ProductFeeId,
+                    Price,
+                    IsTaxable,
+                    Description,
+                    TaxCode
+            )
+            OUTPUT inserted.ProductFeeId, NULL, NULL, inserted.Id
+            INTO #invoiceDetails
+            SELECT
+                @bookingId,
+                pf.Id,
+                pf.Amount,
+                pf.IsTaxable,
+                pf.Description,
+                pf.TaxCode
+            FROM prdct.ProductFee pf
+            WHERE ProductTypeId = 9
+                AND GETDATE()
+                BETWEEN pf.ValidFrom and pf.ValidTo
+                AND @parkId = pf.ParkId
+            ORDER by id DESC
+
+            /* Insert BaseParticipant */
+            INSERT INTO booking.BookingParticipant (
+                BookingId,
+                ParticipantTypeId,
+                BundleScheduleId,
+                BundleName,
+                Count,
+                Price,
+                IsTaxable,
+                TaxCode,
+                ExternalId
+            )
+            OUTPUT inserted.ExternalId, NULL, inserted.Id, NULL
+            INTO #invoiceDetails
+            SELECT @bookingId,
+                   1,
+                   c.BaseBundleScheduleId,
+                   b.Name,
+                   c.BaseParticipantCount,
+                   bs.Amount,
+                   cat.IsTaxable,
+                   cat.TaxCode,
+                   b.ExternalId
+            FROM booking.Cart c
+            JOIN product.BundleSchedule bs
+                 ON c.BaseBundleScheduleId = bs.Id
+            JOIN product.Bundle b
+                 ON bs.BundleId = b.Id
+            JOIN product.Category cat
+                 ON b.CategoryId = cat.Id
+            WHERE @cookieId = c.CookieId;
+
+            /* Insert ExtraParticipant */
+            INSERT INTO booking.BookingParticipant (
+                BookingId,
+                ParticipantTypeId,
+                BundleScheduleId,
+                BundleName,
+                Count,
+                Price,
+                IsTaxable,
+                TaxCode,
+                ExternalId
+            )
+            OUTPUT inserted.ExternalId, NULL, inserted.Id, NULL
+            INTO #invoiceDetails
+            SELECT @bookingId,
+                   2,
+                   c.ExtraBundleScheduleId,
+                   b.Name,
+                   c.ExtraParticipantCount,
+                   bs.Amount,
+                   cat.IsTaxable,
+                   cat.TaxCode,
+                   b.ExternalId
+            FROM booking.Cart c
+            JOIN product.BundleSchedule bs
+                 ON c.ExtraBundleScheduleId = bs.Id
+            JOIN product.Bundle b
+                 ON bs.BundleId = b.Id
+            JOIN product.Category cat
+                 ON b.CategoryId = cat.Id
+            WHERE @cookieId = c.CookieId;
+
+            /* Insert AdultParticipant */
+            INSERT INTO booking.BookingParticipant (
+                BookingId,
+                ParticipantTypeId,
+                BundleScheduleId,
+                BundleName,
+                Count,
+                Price,
+                IsTaxable,
+                TaxCode,
+                ExternalId
+            )
+            OUTPUT inserted.ExternalId, NULL, inserted.Id, NULL
+            INTO #invoiceDetails
+            SELECT @bookingId,
+                   3,
+                   c.AdultBundleScheduleId,
+                   b.Name,
+                   c.AdultParticipantCount,
+                   COALESCE(IIF(bs.Amount = 0, ROUND(ep.Price * 0.5, 2), bs.Amount), 0),
+                   cat.IsTaxable,
+                   cat.TaxCode,
+                   b.ExternalId
+            FROM booking.Cart c
+            JOIN product.BundleSchedule bs
+                 ON c.AdultBundleScheduleId = bs.Id
+            JOIN product.Bundle b
+                 ON bs.BundleId = b.Id
+            JOIN product.Category cat
+                 ON b.CategoryId = cat.Id
+            OUTER APPLY
+            (
+                SELECT bp.Price
+                FROM booking.BookingParticipant bp
+                WHERE bp.BookingId = @bookingId
+                  AND bp.ParticipantTypeId = 2
+            ) ep
+            WHERE @cookieId = c.CookieId;
+
+            /* Insert Resource */
+            INSERT INTO booking.BookingResource (
+                BookingId,
+                ResourceTypeName,
+                ResourceName,
+                Price,
+                PercentAllocation
+            )
+            SELECT @bookingId,
+                   rt.Name,
+                   r.Name,
+                   r.Price,
+                   lrt.PercentAllocation
+            FROM booking.Cart c
+            JOIN booking.ScheduleDetails sd
+                 ON sd.Id = c.ScheduleDetailId
+            JOIN booking.Resource r
+                 ON sd.ResourceId = r.Id
+            JOIN booking.ResourceType rt
+                 ON r.ResourceTypeId = rt.Id
+            JOIN booking.LocationResourceType lrt
+                ON lrt.ResourceTypeId = rt.Id
+                    AND lrt.LocationId = c.ParkId
+            WHERE @cookieId = c.CookieId;
+
+            /* Insert BookingItems */
+            INSERT INTO booking.BookingItem (
+                BookingId,
+                ParkProductId,
+                TicketId,
+                ParkProductName,
+                Included,
+                Quantity,
+                Price,
+                IsTaxable,
+                TaxCode,
+                ExternalId,
+                PercentAllocation,
+                RelatedBookingParticipantId,
+                RelatedBookingResourceId,
+                CreatedBy,
+                CreatedDate,
+                ModifiedBy,
+                ModifiedDate
+            )
+            OUTPUT inserted.ExternalId, inserted.Id, NULL, NULL
+            INTO #invoiceDetails
+            SELECT @bookingId,
+                   ci.ParkProductId,
+                   ci.TicketId,
+                   COALESCE(pp.Name, t.Name),
+                   ci.Included,
+                   ci.Quantity,
+                   ci.Price,
+                   COALESCE(pp.IsTaxable, cat.IsTaxable),
+                   COALESCE(pp.TaxCode, cat.TaxCode),
+                   CONCAT(COALESCE(pcp.ExternalId, t.ExternalId), '-C', ci.Id),
+                   COALESCE(bp.PercentAllocation, (prtm.PercentAllocation / prtm.Quantity) * ci.Quantity),
+                   bpar.Id,
+                   IIF(ci.RelatedScheduleDetailId IS NOT NULL, @bookingId, NULL),
+                   @modifiedBy,
+                   SYSDATETIMEOFFSET(),
+                   @modifiedBy,
+                   SYSDATETIMEOFFSET()
+            FROM booking.CartItem ci
+            LEFT JOIN prdct.ParkProduct pp
+                 ON ci.ParkProductId = pp.Id
+            LEFT JOIN prdct.ProductChannelProduct pcp
+                 ON pp.Id = pcp.ParkProductId
+            LEFT JOIN product.BundleSchedule s
+                ON ci.RelatedBundleScheduleId = s.Id
+            LEFT JOIN product.BundleProduct bp
+                ON bp.BundleId = s.BundleId
+                    AND (bp.ParkProductId = pp.Id
+                        OR bp.TicketId = ci.TicketId)
+            LEFT JOIN product.Ticket t
+                ON t.Id = ci.TicketId
+            LEFT JOIN product.Category cat
+                ON cat.Id = t.CategoryId
+            LEFT JOIN booking.BookingParticipant bpar
+                ON bpar.BundleScheduleId = ci.RelatedBundleScheduleId
+                    AND bpar.BookingId = @bookingId
+            LEFT JOIN booking.ScheduleDetails sd
+                ON sd.Id = ci.RelatedScheduleDetailId
+            LEFT JOIN booking.Resource r
+                ON r.Id = sd.ResourceId
+            LEFT JOIN booking.ParkResourceTypeModifier prtm
+                ON r.ResourceTypeId = prtm.ResourceTypeId
+                    AND prtm.ParkId = pp.ParkId
+                    AND prtm.ProductModifierTypeId = pp.ProductModifierTypeId
+                    AND prtm.Deleted IS NULL
+            WHERE ci.CartId = @cartId
+
+            /* Add PersonContracts */
+            INSERT INTO acct.PersonContract (AccountId, PersonId, ParkId, ParkDocumentId, SignedOnDate, ExpirationDate)
+            SELECT @accountId, @personId, @parkId, pd.Id, SYSDATETIMEOFFSET(), '9999-12-31'
+            FROM park.ParkDocument pd
+            WHERE ParkId = @parkId
+              AND pd.DocumentType IN (3, 4, 5, 7) /* (ESignatureAgreement, TermsOfUse, PrivacyPolicy, BookingAgreement) */
+              AND pd.IsActive = 1
+
+            SELECT @modifiedBy = CreatedBy
+            FROM booking.Booking
+            WHERE Id = @bookingId;
+
+            /* Handling BookingDiscount for promotion */
+            INSERT INTO booking.BookingDiscount (
+                BookingId,
+                Amount,
+                IsPercentage,
+                Description,
+                PromotionId,
+                CreatedDate,
+                CreatedBy,
+                ModifiedDate,
+                ModifiedBy)
+            SELECT b.Id,
+                   ABS(p.Discount),
+                   p.IsPercentage,
+                   'Promotion - ' + p.Code,
+                   b.PromotionId,
+                   SYSDATETIMEOFFSET(),
+                   @modifiedBy,
+                   SYSDATETIMEOFFSET(),
+                   @modifiedBy
+            FROM booking.Booking b
+                     JOIN booking.Promotion p ON b.PromotionId = p.Id
+            WHERE b.Id = @bookingId
+              AND ABS(p.Discount) > 0;
+
+            /* Update the FK reference in invoice.InvoiceDetail */
+            IF @@ROWCOUNT > 0
+                BEGIN
+                    UPDATE id SET
+                        BookingDiscountId = bd.Id
+                    FROM booking.BookingDiscount bd
+                         JOIN invoice.InvoiceHeader ih ON bd.BookingId = ih.BookingId
+                         JOIN invoice.InvoiceDetail id ON ih.Id = id.InvoiceHeaderId
+                    WHERE bd.Id = @bookingId
+                      AND bd.PromotionId IS NOT NULL  /* make sure it's promotion */
+                      AND bd.Description = id.Description  /* matching the same name */
+                      AND id.UnitPrinciple <> 0 AND id.Quantity <> 0   /* the non-zero ones */
+                      AND id.InvoiceDetailStatusId = 1; /* active */
+                END
+
+            SET @markFeesAsPaid = 1;
+        END;
+    /* If booking exists */
+    ELSE
+
+        BEGIN
+            DECLARE @currentRowVersion TIMESTAMP =
+                (
+                    SELECT TOP (1) b.RowVer
+                    FROM booking.Booking b
+                    JOIN booking.Cart c
+                         ON b.Id = c.BookingId
+                    WHERE @cookieId = c.CookieId
+                );
+
+            IF @currentRowVersion = @rowVer
+                BEGIN
+                    /* Update booking */
+                    UPDATE booking.Booking
+                    SET ScheduleDetailId = c.ScheduleDetailId,
+                        ProductLevelId = c.ProductLevelId,
+                        RequiresHandicap = c.RequiresHandicap,
+                        ModifiedBy       = @modifiedBy,
+                        ModifiedDate     = SYSDATETIMEOFFSET(),
+                        DepositPrice     = ISNULL(b.DepositPrice, pk.BookingDepositAmount),
+                        InternalNotes    = c.InternalNotes,
+                        ExternalNotes    = c.ExternalNotes,
+                        PromotionId      = c.PromotionId,
+                        PartyHostId      = IIF(@clearPartyHost = 1, NULL, b.PartyHostId)
+                    FROM booking.Booking b
+                    JOIN booking.Cart c
+                         ON c.BookingId = b.Id
+                    JOIN park.Park pk
+                         ON b.ParkId = pk.Id
+                    WHERE b.Id = @bookingId;
+
+                    /* Remove existing GuestsOfHonor */
+                    DELETE
+                    FROM booking.BookingGuestOfHonor
+                    WHERE BookingId = @bookingId;
+
+                    /* Insert new GuestsOfHonor */
+                    INSERT INTO booking.BookingGuestOfHonor
+                    (BookingId,
+                     FirstName,
+                     LastName,
+                     DateOfBirth)
+                    SELECT @bookingId,
+                           cgoh.FirstName,
+                           cgoh.LastName,
+                           cgoh.DateOfBirth
+                    FROM booking.CartGuestOfHonor cgoh
+                    WHERE CartId = @cartId;
+
+                    /* UPDATE booking.BookingParticipant, only update if bundle schedule ids are not equal */
+                    /* Update BaseParticipant */
+                    UPDATE booking.BookingParticipant
+                    SET Price            = IIF(c.BaseBundleScheduleId = bp.BundleScheduleId, bp.Price, bs.Amount),
+                        BundleScheduleId = c.BaseBundleScheduleId,
+                        BundleName       = b.Name,
+                        Count            = c.BaseParticipantCount,
+                        IsTaxable        = cat.IsTaxable,
+                        TaxCode          = cat.TaxCode,
+                        ExternalId       = b.ExternalId
+                    FROM booking.BookingParticipant bp
+                    JOIN booking.Cart c
+                         ON c.BookingId = bp.BookingId
+                    JOIN product.BundleSchedule bs
+                         ON c.BaseBundleScheduleId = bs.Id
+                    JOIN product.Bundle b
+                         ON bs.BundleId = b.Id
+                    JOIN product.Category cat
+                         ON b.CategoryId = cat.Id
+                    WHERE bp.BookingId = @bookingId
+                      AND bp.ParticipantTypeId = 1;
+
+                    /* Update ExtraParticipant */
+                    UPDATE booking.BookingParticipant
+                    SET Price            = IIF(c.ExtraBundleScheduleId = bp.BundleScheduleId, bp.Price, bs.Amount),
+                        BundleScheduleId = c.ExtraBundleScheduleId,
+                        BundleName       = b.Name,
+                        Count            = c.ExtraParticipantCount,
+                        IsTaxable        = cat.IsTaxable,
+                        TaxCode          = cat.TaxCode,
+                        ExternalId       = b.ExternalId
+                    FROM booking.BookingParticipant bp
+                    JOIN booking.Cart c
+                         ON c.BookingId = bp.BookingId
+                    JOIN product.BundleSchedule bs
+                         ON c.ExtraBundleScheduleId = bs.Id
+                    JOIN product.Bundle b
+                         ON bs.BundleId = b.Id
+                    JOIN product.Category cat
+                         ON b.CategoryId = cat.Id
+                    WHERE bp.BookingId = @bookingId
+                      AND bp.ParticipantTypeId = 2;
+
+                    /* Update AdultParticipant */
+                    UPDATE booking.BookingParticipant
+                    SET Price            = IIF(c.AdultBundleScheduleId = bp.BundleScheduleId, bp.Price,
+                                               IIF(bs.Amount = 0, ROUND(ep.Price * 0.5, 2), bs.Amount)),
+                        BundleScheduleId = c.AdultBundleScheduleId,
+                        BundleName       = b.Name,
+                        Count            = c.AdultParticipantCount,
+                        IsTaxable        = cat.IsTaxable,
+                        TaxCode          = cat.TaxCode,
+                        ExternalId       = b.ExternalId
+                    FROM booking.BookingParticipant bp
+                    JOIN booking.Cart c
+                         ON c.BookingId = bp.BookingId
+                    JOIN product.BundleSchedule bs
+                         ON c.AdultBundleScheduleId = bs.Id
+                    JOIN product.Bundle b
+                         ON bs.BundleId = b.Id
+                    JOIN product.Category cat
+                         ON b.CategoryId = cat.Id
+                    OUTER APPLY
+                    (
+                        SELECT bp.Price
+                        FROM booking.BookingParticipant bp
+                        WHERE bp.BookingId = @bookingId
+                          AND bp.ParticipantTypeId = 2
+                    ) ep
+                    WHERE bp.BookingId = @bookingId
+                      AND bp.ParticipantTypeId = 3;
+
+                    /* Update Booking Resource, only change price if resource type has changed */
+                    UPDATE booking.BookingResource
+                    SET ResourceTypeName = rt.Name,
+                        ResourceName     = r.Name,
+                        Price            = IIF(rt.Name = br.ResourceTypeName, br.Price, r.Price),
+                        PercentAllocation = lrt.PercentAllocation
+                    FROM booking.BookingResource br
+                    JOIN booking.Cart c
+                         ON c.BookingId = br.BookingId
+                    JOIN booking.ScheduleDetails sd
+                         ON sd.Id = c.ScheduleDetailId
+                    JOIN booking.Resource r
+                         ON sd.ResourceId = r.Id
+                    JOIN booking.ResourceType rt
+                         ON r.ResourceTypeId = rt.Id
+                    JOIN booking.LocationResourceType lrt
+                        ON lrt.ResourceTypeId = rt.Id
+                            AND c.ParkId = lrt.LocationId
+                    WHERE br.BookingId = @bookingId;
+
+                    /* Remove existing BookingItems */
+                    UPDATE rid
+                    SET ModifiedBy = @modifiedBy,
+                        ModifiedDate = SYSDATETIMEOFFSET(),
+                        InvoiceDetailStatusId = 2 /* Voided */
+                    FROM invoice.InvoiceDetail id
+                        JOIN booking.BookingItem bi
+                            ON id.BookingItemId = bi.Id
+                        JOIN invoice.InvoiceDetail rid
+                            ON rid.RelatedInvoiceDetailId = id.Id
+                    WHERE bi.BookingId = @bookingId
+
+                    UPDATE id
+                    SET ModifiedBy = @modifiedBy,
+                        ModifiedDate = SYSDATETIMEOFFSET(),
+                        InvoiceDetailStatusId = 2 /* Voided */
+                    FROM invoice.InvoiceDetail id
+                        JOIN booking.BookingItem bi
+                            ON id.BookingItemId = bi.Id
+                    WHERE bi.BookingId = @bookingId
+
+                    UPDATE pid
+                    SET ModifiedBy = @modifiedBy,
+                        ModifiedDate = SYSDATETIMEOFFSET(),
+                        PaymentInvoiceDetailStatusId = 2 /* Voided */
+                    FROM invoice.PaymentInvoiceDetail pid
+                    JOIN invoice.InvoiceDetail id
+                        ON id.Id = pid.InvoiceDetailId
+                    JOIN invoice.InvoiceHeader ih
+                        ON id.InvoiceHeaderId = ih.Id
+                    WHERE ih.BookingId = @bookingId;
+
+                    UPDATE booking.BookingItem
+                    SET Deleted = SYSDATETIMEOFFSET(),
+                        ModifiedBy = @modifiedBy,
+                        ModifiedDate = SYSDATETIMEOFFSET()
+                    WHERE BookingId = @bookingId;
+
+                /* Insert new BookingItems */
+                    INSERT INTO booking.BookingItem (
+                        BookingId,
+                        ParkProductId,
+                        TicketId,
+                        ParkProductName,
+                        Included,
+                        Quantity,
+                        Price,
+                        IsTaxable,
+                        TaxCode,
+                        ExternalId,
+                        PercentAllocation,
+                        RelatedBookingParticipantId,
+                        RelatedBookingResourceId,
+                        CreatedBy,
+                        CreatedDate,
+                        ModifiedBy,
+                        ModifiedDate
+                    )
+                    OUTPUT inserted.ExternalId, inserted.Id, NULL, NULL
+                    INTO #invoiceDetails
+                    SELECT @bookingId,
+                           ci.ParkProductId,
+                           ci.TicketId,
+                           COALESCE(pp.Name, t.Name),
+                           ci.Included,
+                           ci.Quantity,
+                           ci.Price,
+                           COALESCE(pp.IsTaxable, cat.IsTaxable),
+                           COALESCE(pp.TaxCode, cat.TaxCode),
+                           CONCAT(COALESCE(pcp.ExternalId, t.ExternalId), '-C', ci.Id),
+                           COALESCE(bp.PercentAllocation, (prtm.PercentAllocation / prtm.Quantity) * ci.Quantity),
+                           bpar.Id,
+                           IIF(ci.RelatedScheduleDetailId IS NOT NULL, @bookingId, NULL),
+                           @modifiedBy,
+                           SYSDATETIMEOFFSET(),
+                           @modifiedBy,
+                           SYSDATETIMEOFFSET()
+                    FROM booking.CartItem ci
+                    LEFT JOIN prdct.ParkProduct pp
+                         ON ci.ParkProductId = pp.Id
+                    LEFT JOIN prdct.ProductChannelProduct pcp
+                         ON pp.Id = pcp.ParkProductId
+                    LEFT JOIN product.BundleSchedule s
+                        ON ci.RelatedBundleScheduleId = s.Id
+                    LEFT JOIN product.BundleProduct bp
+                        ON bp.BundleId = s.BundleId
+                            AND (bp.ParkProductId = pp.Id
+                                OR bp.TicketId = ci.TicketId)
+                    LEFT JOIN product.Ticket t
+                        ON t.Id = ci.TicketId
+                    LEFT JOIN product.Category cat
+                        ON cat.Id = t.CategoryId
+                    LEFT JOIN booking.BookingParticipant bpar
+                        ON bpar.BundleScheduleId = ci.RelatedBundleScheduleId
+                            AND bpar.BookingId = @bookingId
+                    LEFT JOIN booking.ScheduleDetails sd
+                        ON sd.Id = ci.RelatedScheduleDetailId
+                    LEFT JOIN booking.Resource r
+                        ON r.Id = sd.ResourceId
+                    LEFT JOIN booking.ParkResourceTypeModifier prtm
+                        ON r.ResourceTypeId = prtm.ResourceTypeId
+                            AND prtm.ParkId = pp.ParkId
+                            AND prtm.ProductModifierTypeId = pp.ProductModifierTypeId
+                            AND prtm.Deleted IS NULL
+                    WHERE ci.CartId = @cartId;
+
+                    /* Handling BookingDiscount for promotion */
+                    /* first clean up (if there is any) */
+                    UPDATE booking.BookingDiscount SET
+                       Deleted = SYSDATETIMEOFFSET(),
+                       ModifiedDate = SYSDATETIMEOFFSET(),
+                       ModifiedBy = @modifiedBy
+                    WHERE BookingId = @bookingId
+                      AND PromotionId IS NOT NULL;    /* make sure it's promotion */
+
+                    /* next insert discount for promotion (if there is any) */
+                    INSERT INTO booking.BookingDiscount (
+                        BookingId,
+                        Amount,
+                        IsPercentage,
+                        Description,
+                        PromotionId,
+                        CreatedDate,
+                        CreatedBy,
+                        ModifiedDate,
+                        ModifiedBy)
+                    SELECT b.Id,
+                           ABS(p.Discount),
+                           p.IsPercentage,
+                           'Promotion - ' + p.Code,
+                           b.PromotionId,
+                           SYSDATETIMEOFFSET(),
+                           @modifiedBy,
+                           SYSDATETIMEOFFSET(),
+                           @modifiedBy
+                    FROM booking.Booking b
+                             JOIN booking.Promotion p ON b.PromotionId = p.Id
+                    WHERE b.Id = @bookingId
+                      AND ABS(p.Discount) > 0;
+
+                    /* Update the FK reference in invoice.InvoiceDetail */
+                    /* It's necessary by both the cleanup and the insert above  */
+                    UPDATE id SET BookingDiscountId = 
+                        CASE
+                            WHEN bbs.Deleted IS NULL    /* not deleted ones */
+                                     AND id.UnitPrinciple <> 0 AND id.Quantity <> 0   /* the non-zero ones */
+                                     AND id.InvoiceDetailStatusId = 1  /* active */
+                                THEN bbs.Id
+                            ELSE NULL
+                        END
+                    FROM booking.BookingDiscount bbs
+                             JOIN invoice.InvoiceHeader ih ON bbs.BookingId = ih.BookingId
+                             JOIN invoice.InvoiceDetail id ON ih.Id = id.InvoiceHeaderId
+                    WHERE bbs.BookingId = @bookingId
+                      AND bbs.Description = id.Description  /* matching the same name */
+                      AND bbs.PromotionId IS NOT NULL;  /* make sure it's promotion */
+                END;
+            ELSE
+                BEGIN
+                    IF @currentRowVersion IS NULL
+                        BEGIN
+                            THROW 52000, 'Record not found.', 16;
+                        END;
+                    ELSE
+                        BEGIN
+                            THROW 51000, 'You do not have the latest copy of this record.', 16;
+                        END;
+                END;
+        END;
+
+    IF @invoiceHeaderId IS NOT NULL
+        BEGIN
+            UPDATE invoice.InvoiceHeader
+            SET BookingId = @bookingId
+            WHERE invoice.InvoiceHeader.Id = @invoiceHeaderId
+        END
+
+    /* Update all invoice details but resource */
+    UPDATE u
+    SET u.BookingItemId = i.BookingItemId,
+        u.BookingParticipantId = i.BookingParticipantId,
+        u.BookingFeeId = i.BookingFeeId,
+        u.ModifiedBy = @modifiedBy,
+        u.ModifiedDate = SYSDATETIMEOFFSET()
+    FROM invoice.InvoiceDetail u
+    JOIN #invoiceDetails i
+        ON u.ExternalId = i.ExternalId
+    JOIN invoice.InvoiceHeader ih
+        ON u.InvoiceHeaderId = ih.Id
+    WHERE ih.BookingId = @bookingId
+
+    /* Update booking resourceId to booking ID */
+    UPDATE id
+    SET id.BookingResourceId = @bookingId,
+        id.ModifiedBy = @modifiedBy,
+        id.ModifiedDate = SYSDATETIMEOFFSET()
+    FROM invoice.InvoiceDetail id
+    JOIN invoice.InvoiceHeader ih
+        ON id.InvoiceHeaderId = ih.Id
+    WHERE ih.BookingId = @bookingId
+        and id.InvoiceDetailStatusId = 1 /* Active */
+        AND (RIGHT(id.ExternalId, 2) = '-R'
+            OR id.ExternalId = 'Resource');
+
+    /* Handling BookingDiscount for entitlement */
+    /* clean up first (if there is any, and the incoming @accountEntitlementId may be a different one) */
+    UPDATE booking.BookingDiscount SET
+       Deleted = SYSDATETIMEOFFSET(),
+       ModifiedDate = SYSDATETIMEOFFSET(),
+       ModifiedBy = @modifiedBy
+    WHERE BookingId = @bookingId
+      AND AccountEntitlementId IS NOT NULL;  /* make sure it's entitlement */
+    
+    /* update FK reference to NULL */
+    IF @@ROWCOUNT > 0
+      BEGIN
+          UPDATE id
+            SET id.BookingDiscountId = NULL
+          FROM invoice.InvoiceDetail id
+           JOIN booking.BookingDiscount bs ON id.BookingDiscountId = bs.Id
+          WHERE bs.BookingId = @bookingId
+            AND bs.AccountEntitlementId IS NOT NULL  /* make sure it's entitlement */
+            /* AND id.InvoiceDetailStatusId = 1 */ /* active */
+          ;
+      END
+
+    /* insert discount for entitlement */
+    IF (@accountEntitlementId IS NOT NULL)
+      BEGIN
+          INSERT INTO #bookingDiscount (
+              BookingId,
+              InvoiceDetailId,
+              Amount,
+              IsPercentage,
+              Description,
+              AccountEntitlementId,
+              PromotionId,
+              CreatedDate,
+              CreatedBy,
+              ModifiedDate,
+              ModifiedBy)
+          /* should get only 1 row per booking */
+          SELECT @bookingId, id.Id InvoiceDetailId, 
+                 ABS(((id.UnitPrinciple + id.UnitTax) * id.Quantity)) Discount,
+                 0, -- ae.IsPercentage, -- already calculated for percentage??
+                 id.Description,
+                 @accountEntitlementId, NULL,
+                SYSDATETIMEOFFSET(),
+                @modifiedBy,
+                SYSDATETIMEOFFSET(),
+                @modifiedBy
+          FROM invoice.InvoiceHeader ih
+               JOIN invoice.InvoiceDetail id ON ih.Id = id.InvoiceHeaderId
+               /* JOIN acct.AccountEntitlements ae ON ae.Id = @accountEntitlementId */   -- this is NOT really a join (so make sure it's only 1 row)
+          WHERE ih.BookingId = @bookingId
+            AND id.InvoiceDetailStatusId = 1    /* Active */
+            AND id.Description like 'Entitlement - %'
+            AND ABS(id.UnitPrinciple) > 0
+            AND ABS(id.UnitTax) > 0
+            AND ABS(id.Quantity) > 0
+          ;
+
+          INSERT INTO booking.BookingDiscount (BookingId, Amount, IsPercentage, Description, AccountEntitlementId, PromotionId,
+                                               CreatedBy, CreatedDate, ModifiedBy, ModifiedDate)
+          SELECT BookingId, Amount, IsPercentage, Description, AccountEntitlementId, PromotionId,
+                 CreatedBy, CreatedDate, ModifiedBy, ModifiedDate
+          FROM #bookingDiscount;
+
+          /* Update the FK reference in invoice.InvoiceDetail */
+          IF @@ROWCOUNT > 0
+              BEGIN
+                  UPDATE id SET
+                      BookingDiscountId = bbs.Id
+                  FROM booking.BookingDiscount bbs
+                       JOIN #bookingDiscount bs ON bbs.BookingId = bs.BookingId
+                       JOIN invoice.InvoiceHeader ih ON bs.BookingId = ih.BookingId
+                       JOIN invoice.InvoiceDetail id ON ih.Id = id.InvoiceHeaderId
+                  WHERE bbs.BookingId = @bookingId
+                    AND bs.InvoiceDetailId = id.Id  /* this is precise (no need for more criteria) */
+                 ;
+              END
+      END  
+
+    EXEC booking.CreateBookingAudit @bookingId, @modifiedBy;
+
+    SELECT CONVERT(NVARCHAR(MAX), (
+        SELECT
+           b.Id,
+           b.Booked,
+           brnds.PartyStoreUrl [Park.Brand.PartyStoreUrl]
+        FROM booking.Booking b
+            JOIN park.Park pk on b.ParkId = pk.Id
+            JOIN dbo.Brands brnds
+                ON pk.BrandId = brnds.Id
+        WHERE @bookingId = b.Id
+      FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+    )) DATA
+
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRAN;
+        THROW;
+    END CATCH
+    COMMIT TRAN;
+END;
+GO
+
+
