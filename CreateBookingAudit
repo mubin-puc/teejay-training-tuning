@@ -1,0 +1,185 @@
+/****** Object:  StoredProcedure [booking].[CreateBookingAudit]    Script Date: 8/2/2026 9:20:02 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [booking].[CreateBookingAudit](
+    @bookingId INT,
+    @changeUser NVARCHAR(256)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @bookingJson NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), (
+        SELECT
+            b.Id,
+            b.PartyHostId,
+            b.RequiresHandicap,
+            b.HasProtectionPlan,
+            b.InternalNotes,
+            b.ExternalNotes,
+            b.Booked,
+            b.Paid,
+            b.InvoiceId,
+            b.Canceled,
+            b.Deleted,
+            b.CreatedBy,
+            b.CreatedDate,
+            b.ModifiedBy,
+            b.ModifiedDate,
+            b.DepositPrice,
+            b.IsSpecialEvent,
+            b.RelatedBookingId,
+            se.Id [SpecialEvent.Id],
+            se.CookieId [SpecialEvent.CookieId],
+            se.OrganizationName [SpecialEvent.OrganizationName],
+            se.IsTaxExempt [SpecialEvent.IsTaxExempt],
+            se.ContactFirstName [SpecialEvent.ContactFirstName],
+            se.ContactLastName [SpecialEvent.ContactLastName],
+            se.EmailAddress [SpecialEvent.EmailAddress],
+            se.PhoneNumber [SpecialEvent.PhoneNumber],
+            se.BasePrice [SpecialEvent.BasePrice],
+            se.BaseParticipantCount [SpecialEvent.BaseParticipantCount],
+            se.ExtraPrice [SpecialEvent.ExtraPrice],
+            se.ExtraParticipantCount [SpecialEvent.ExtraParticipantCount],
+            se.TaxCode [SpecialEvent.TaxCode],
+            br.ResourceTypeName [BookingResource.ResourceTypeName],
+            br.ResourceName [BookingResource.ResourceName],
+            br.Price [BookingResource.Price],
+            sd.Id [ScheduleDetail.Id],
+            sd.StartHour [ScheduleDetail.StartHour],
+            sd.EndHour [ScheduleDetail.EndHour],
+            sd.ResourceId [ScheduleDetail.ResourceId],
+            sd.PartyThemeId [ScheduleDetail.PartyThemeId],
+            sd.MinimumProductLevelId [ScheduleDetail.MinimumProductLevelId],
+            s.Id [ScheduleDetail.Schedule.Id],
+            s.TemplateId [ScheduleDetail.Schedule.TemplateId],
+            s.Date [ScheduleDetail.Schedule.Date],
+            pk.Id [Park.id],
+            pk.Name [Park.Name],
+            ap.AccountId [Account.Id],
+            p.FirstName [Account.PrimaryAccountHolder.FirstName],
+            p.LastName [Account.PrimaryAccountHolder.LastName],
+            pl.Id [ProductLevel.Id],
+            pl.Name [ProductLevel.Name],
+            (
+                SELECT
+                    bf.Id,
+                    bf.ProductFeeId,
+                    bf.Price,
+                    bf.IsTaxable,
+                    bf.Description,
+                    bf.TaxCode
+                FROM booking.BookingFee bf
+                WHERE b.Id = bf.BookingId
+                FOR JSON PATH
+            ) Fees,
+            (
+                SELECT
+                    g.Id,
+                    g.FirstName,
+                    g.LastName,
+                    g.DateOfBirth
+                FROM booking.BookingGuestOfHonor g
+                WHERE b.Id = g.BookingId
+                FOR JSON PATH
+            ) Guests,
+            (
+                SELECT
+                    i.Id,
+                    i.ParkProductId,
+                    i.ParkProductName,
+                    i.Included,
+                    i.Quantity,
+                    i.Price,
+                    i.IsTaxable,
+                    i.TaxCode,
+                    i.ExternalId
+                FROM booking.BookingItem i
+                WHERE b.Id = i.BookingId
+                    AND i.Deleted IS NULL
+                FOR JSON PATH
+            ) Items,
+            (
+                SELECT
+                    p.Id,
+                    p.ParticipantTypeId,
+                    p.BundleScheduleId,
+                    p.BundleName,
+                    p.Count,
+                    p.Price,
+                    p.IsTaxable,
+                    p.TaxCode,
+                    p.ExternalId
+                FROM booking.BookingParticipant p
+                WHERE b.Id = p.BookingId
+                FOR JSON PATH
+            ) Participants
+        FROM booking.Booking b
+        JOIN booking.ScheduleDetails sd
+            ON b.ScheduleDetailId = sd.Id
+        JOIN booking.Schedule s
+            ON sd.ScheduleId = s.Id
+            AND s.Deleted IS NULL
+        JOIN prdct.ProductLevel pl
+            ON b.ProductLevelId = pl.Id
+        LEFT JOIN booking.BookingSpecialEvent se
+            ON b.Id = se.BookingId
+        LEFT JOIN booking.BookingResource br
+            ON b.Id = br.BookingId
+        LEFT JOIN acct.AccountPerson ap
+            ON b.AccountId = ap.AccountId
+                AND ap.AccountRoleId = 2 /* Owner */
+        LEFT JOIN acct.Person p
+            ON ap.PersonId = p.Id
+        LEFT JOIN park.Park pk
+            ON b.ParkId = pk.Id
+        WHERE @bookingId = b.Id
+        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+    ));
+
+    INSERT INTO booking.BookingAudit (BookingId, PackagePrice, ResourcePrice, ParticipantTotal, AddonTotal, BookingJson, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate)
+    SELECT
+        @bookingId,
+        ISNULL(base.Price, ISNULL(se.BasePrice, 0)),
+        ISNULL(br.Price, 0),
+        ISNULL(extra.Amount, ISNULL(se.ExtraPrice * se.ExtraParticipantCount, 0)),
+        ISNULL(item.Amount, 0),
+        @bookingJson,
+        @changeUser,
+        SYSDATETIMEOFFSET(),
+        @changeUser,
+        SYSDATETIMEOFFSET()
+    FROM booking.Booking b
+    LEFT JOIN booking.BookingResource br
+        ON b.Id = br.BookingId
+    LEFT JOIN booking.BookingSpecialEvent se
+        ON b.Id = se.BookingId
+    OUTER APPLY (
+        SELECT bp.Price
+        FROM booking.BookingParticipant bp
+        WHERE b.Id = bp.BookingId
+          AND bp.ParticipantTypeId = 1 /* Base */
+    ) base
+    OUTER APPLY (
+        SELECT SUM(bp.Price * bp.Count) Amount
+        FROM booking.BookingParticipant bp
+        WHERE b.Id = bp.BookingId
+          AND bp.ParticipantTypeId IN (2, 3) /* Extra, Adult */
+    ) extra
+    OUTER APPLY (
+        SELECT SUM(bi.Price * bi.Quantity) Amount
+        FROM booking.BookingItem bi
+        WHERE b.Id = bi.BookingId
+          AND bi.Included = 0
+          AND bi.Deleted IS NULL
+    ) item
+    WHERE @bookingId = b.Id;
+
+END
+GO
+
+
