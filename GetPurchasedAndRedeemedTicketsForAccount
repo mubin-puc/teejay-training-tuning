@@ -1,0 +1,143 @@
+/****** Object:  StoredProcedure [acct].[GetPurchasedAndRedeemedTicketsForAccount]    Script Date: 8/15/2026 10:24:27 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+================================================================================
+  acct.GetPurchasedAndRedeemedTicketsForAccount  —  REWRITE v2 (VALIDATED)
+  STATUS: NOT DEPLOYED. Validated read-only on the prod replica; deploy after QA.
+================================================================================
+
+VALIDATION (prod replica, 15 real accounts that returned rows today,
+            87–200 subscriptions each; original run with OPTION(RECOMPILE) to match prod):
+  - CORRECTNESS: 15/15 exact match. Distinct row set identical (EXCEPT both directions
+    returns 0 missing / 0 extra). Raw counts also equal (o_raw = o_dist = n_cnt) — no
+    duplicate rows appeared in the sample.
+  - PERFORMANCE (elapsed): total 3,205 ms -> 107 ms. Worst originals:
+      acct 1187606: 937 ms -> 7 ms (134x);  acct 9863463: 856 ms -> 5 ms (171x).
+    Every account now completes in <= 47 ms (was up to 937 ms).
+  - LOGICAL READS (cache-independent, acct 1187606):
+      Original: ~1,220,000 reads (InvoiceDetail scanned 122,749 times), CPU 938 ms.
+      Rewrite:  ~3,400 reads, CPU ~0 ms.   (~360x fewer reads.)
+  - One trivial non-regression: acct 6265455 32 ms -> 47 ms (both sub-50 ms).
+
+WHY THE ORIGINAL WAS SLOW (live Query Store, 14 days):
+  Already had OPTION(RECOMPILE) ("PERF FIX 1", 2026-07-08) yet still hit the 30s command
+  timeout as recently as the analysis date. RECOMPILE only stops stale-plan reuse; it
+  cannot rescue a query SHAPE that forces bad plans:
+    1. Non-SARGable per-row date filter: CONVERT(DATE, col) = CONVERT(DATE, SYSDATETIMEOFFSET() AT TIME ZONE @tz)
+    2. OR spanning two tables (ird.ModifiedDate OR ih.CreatedDate) -> no date index usable
+    3. COALESCE join keys (ih.Id = COALESCE(ird.InvoiceHeaderId,id.InvoiceHeaderId), etc.)
+  Result: single-threaded plans probing 172M-row InvoiceDetail / 22M-row InvoiceHeader,
+  10–17M logical reads or 20–30s CPU on one core -> concurrent checkouts pin all cores.
+
+WHAT THIS REWRITE DOES:
+  - The SELECT columns are functionally determined by the SUBSCRIPTION; the invoice joins
+    are pure existence filters. So we drive from the account's subscriptions (index seek)
+    and prove qualification with small, bounded sets instead of a fan-out join.
+  - "Invoices created today at this location" (hdrToday) is fetched via the
+    (LocationId, CreatedDate) index using a SARGable coarse UTC bracket [@lo,@hi) that is
+    guaranteed to contain every row whose park-local date = @today (any offset is within
+    ±14h). The exact CONVERT(DATE,...)=@today then preserves the original date semantics
+    -- so no timezone/date-boundary behavior change.
+  - The three UNION branches faithfully reproduce the original's COALESCE precedence:
+    the invoice-detail path (R2) only contributes when the subscription has NO redemptions.
+  - OPTION(RECOMPILE) dropped: the seek-driven shape is parameter-stable, removing ~1.77M
+    compiles/day. Re-add only if QA shows drift.
+
+DEPLOY NOTES / SIGN-OFFS:
+  - Result ordering is unspecified in both versions (no ORDER BY); sets are identical.
+  - Theoretical behavior change (did NOT occur in the 15-account sample): if a subscription
+    ever has BOTH multiple qualifying redemptions AND details, the original could emit
+    duplicate rows; this rewrite returns them once. Confirm the caller is fine with distinct
+    rows (it almost certainly is).
+  - Edge (also not observed): if ird.InvoiceHeaderId can be NULL, the original's COALESCE
+    would fall through to a detail header even when a redemption row exists. Re-run the
+    comparison harness after deploy on a broader account sample to keep this covered.
+================================================================================
+*/
+CREATE   PROCEDURE [acct].[GetPurchasedAndRedeemedTicketsForAccount] (
+    @brandSlug    NVARCHAR(25),
+    @locationSlug NVARCHAR(30),
+    @accountId    INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @locationId UNIQUEIDENTIFIER,
+            @timezone   NVARCHAR(50),
+            @brandId    INT;
+
+    SELECT @locationId = pk.Id,
+           @timezone   = pk.Timezone,
+           @brandId    = br.Id
+    FROM park.Park pk
+    JOIN dbo.Brands br ON pk.BrandId = br.Id
+    WHERE br.UrlSlug = @brandSlug
+      AND pk.UrlSlug = @locationSlug;
+
+    IF @locationId IS NULL
+    BEGIN
+        THROW 59400, 'Invalid Location', 16;
+    END
+
+    DECLARE @today DATE = CONVERT(DATE, SYSDATETIMEOFFSET() AT TIME ZONE @timezone);
+    -- SARGable coarse UTC bracket so the (LocationId, CreatedDate) index can seek;
+    -- the exact CONVERT(DATE,...) = @today below preserves original date semantics.
+    DECLARE @lo DATETIMEOFFSET(7) = TODATETIMEOFFSET(CAST(DATEADD(DAY,-1,@today) AS DATETIME2),'+00:00');
+    DECLARE @hi DATETIMEOFFSET(7) = TODATETIMEOFFSET(CAST(DATEADD(DAY, 2,@today) AS DATETIME2),'+00:00');
+
+    ;WITH acctSubs AS (
+        SELECT s.Id, s.TicketId
+        FROM acct.Subscription s                       -- seek: NCL_Subscription_AccountId_SubscriptionStatusId_Incl
+        WHERE s.AccountId = @accountId
+          AND s.SubscriptionStatusId = 301
+          AND s.TicketId IS NOT NULL
+    ),
+    hdrToday AS (                                      -- today's invoices at this location (small)
+        SELECT ih.Id
+        FROM invoice.InvoiceHeader ih                  -- seek: NCL_InvoiceHeader_LocationId_CreatedDate
+        WHERE ih.LocationId = @locationId
+          AND ih.CreatedDate >= @lo AND ih.CreatedDate < @hi
+          AND CONVERT(DATE, ih.CreatedDate) = @today
+    ),
+    qual AS (
+        -- R1a: redemption modified today whose header is at this location
+        SELECT a.Id
+        FROM acctSubs a
+        JOIN invoice.InvoiceRedemptionDetail ird ON ird.SubscriptionId = a.Id
+        JOIN invoice.InvoiceHeader ih ON ih.Id = ird.InvoiceHeaderId AND ih.LocationId = @locationId
+        WHERE CONVERT(DATE, ird.ModifiedDate) = @today
+        UNION
+        -- R1b: redemption created today whose header is at this location
+        SELECT a.Id
+        FROM acctSubs a
+        JOIN invoice.InvoiceRedemptionDetail ird ON ird.SubscriptionId = a.Id
+        JOIN hdrToday h ON h.Id = ird.InvoiceHeaderId
+        UNION
+        -- R2: subscription with NO redemptions -> active detail whose header created today
+        SELECT a.Id
+        FROM acctSubs a
+        JOIN invoice.InvoiceDetail id ON id.SubscriptionId = a.Id AND id.InvoiceDetailStatusId = 1
+        JOIN hdrToday h ON h.Id = id.InvoiceHeaderId
+        WHERE NOT EXISTS (SELECT 1 FROM invoice.InvoiceRedemptionDetail r WHERE r.SubscriptionId = a.Id)
+    )
+    SELECT
+        a.Id  AS SubscriptionId,
+        t.Id  AS TicketId,
+        t.Name AS Name,
+        tpl.WebColor AS Color,
+        tpl.Id AS ProductLevelId
+    FROM acctSubs a
+    JOIN (SELECT DISTINCT Id FROM qual) q ON q.Id = a.Id
+    LEFT JOIN product.Ticket t       ON t.Id = a.TicketId
+    LEFT JOIN prdct.ProductLevel tpl ON tpl.Id = t.ProductLevelId
+    FOR JSON PATH;
+END
+GO
+
+
