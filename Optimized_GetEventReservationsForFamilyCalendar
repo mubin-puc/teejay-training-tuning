@@ -1,0 +1,262 @@
+-- Supporting indexes -- run once, safe to re-run.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_EventReservations_SubscriptionId' AND object_id = OBJECT_ID('events.EventReservations'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_EventReservations_SubscriptionId ON events.EventReservations (SubscriptionId)
+        INCLUDE (FranchiseScheduleDetailId, FromDate, ToDate, Canceled, EventReservationTypeId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_FranchiseScheduleDetails_FranchiseScheduleId' AND object_id = OBJECT_ID('events.FranchiseScheduleDetails'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_FranchiseScheduleDetails_FranchiseScheduleId ON events.FranchiseScheduleDetails (FranchiseScheduleId)
+        INCLUDE (StartDate, EndDate, DayMask, StartTime, EndTime, Canceled, Deleted);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_FranchiseSchedules_ParkId' AND object_id = OBJECT_ID('events.FranchiseSchedules'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_FranchiseSchedules_ParkId ON events.FranchiseSchedules (ParkId)
+        INCLUDE (Name, EventTypeId, LocationId, Deleted, IsActive);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Subscription_AccountId' AND object_id = OBJECT_ID('acct.Subscription'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_Subscription_AccountId ON acct.Subscription (AccountId)
+        INCLUDE (PersonId, ProductId, SubscriptionStatusId, ExpirationDate);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ClassificationEventTypes_EventTypeId' AND object_id = OBJECT_ID('events.ClassificationEventTypes'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_ClassificationEventTypes_EventTypeId ON events.ClassificationEventTypes (EventTypeId) INCLUDE (ClassificationId);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_BrandSettings_BrandId' AND object_id = OBJECT_ID('dbo.BrandSettings'))
+BEGIN
+    CREATE NONCLUSTERED INDEX IX_BrandSettings_BrandId ON dbo.BrandSettings (BrandId, SettingId) INCLUDE (Value);
+END
+GO
+
+
+/****** Object:  StoredProcedure [acct].[GetEventReservationsForFamilyCalendar] -- OPTIMIZED ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE OR ALTER PROCEDURE [acct].[GetEventReservationsForFamilyCalendar](
+    @accountId INT,
+    @fromDate DATE,
+    @toDate DATE,
+    @personId INT = NULL,
+    @onlyActivePending BIT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @now DATETIMEOFFSET = SYSDATETIMEOFFSET();
+
+    /* CORE-332: the [Subscription.Person.Subscriptions] correlated subquery depends only on
+       (per.Id, p.Id) but was re-evaluated once per reservation row (e.g. 883 rows over just 2
+       distinct PersonId/ParkId pairs = ~104K of 163K total logical reads across Subscription /
+       ParkProduct / ProductTemplate). Resolve the in-scope (PersonId, ParkId) pairs once, then
+       materialize the other-active-Subscription ids per pair into an indexed #temp, and filter
+       the current subscription out (os.Id <> s.Id) at projection time. */
+    SELECT DISTINCT
+        s.PersonId,
+        p.Id AS ParkId,
+        p.Timezone
+    INTO #personPark
+    FROM acct.Subscription s
+    JOIN events.EventReservations er
+        ON er.SubscriptionId = s.Id
+    JOIN events.FranchiseScheduleDetails fsd
+        ON fsd.Id = er.FranchiseScheduleDetailId
+    JOIN events.FranchiseSchedules fs
+        ON fsd.FranchiseScheduleId = fs.Id
+    JOIN park.Park p
+        ON fs.ParkId = p.Id
+    WHERE s.AccountId = @accountId;
+
+    -- [OPT] index added so the join below (and the correlated lookup further down) can seek instead of scan
+    CREATE CLUSTERED INDEX IX_personPark ON #personPark (PersonId, ParkId);
+
+    SELECT
+        pp.PersonId,
+        pp.ParkId,
+        os.Id AS OtherSubscriptionId
+    INTO #otherSubs
+    FROM #personPark pp
+    JOIN acct.Subscription os
+        ON os.PersonId = pp.PersonId
+    JOIN prdct.ParkProduct opp
+        ON opp.Id = os.ProductId
+        AND opp.ParkId = pp.ParkId
+    JOIN prdct.ProductTemplate opt
+        ON opt.Id = opp.ProductTemplateId
+        AND opt.ProductTypeId IN (1, 7) /* Membership, Annual Pass */
+    WHERE os.SubscriptionStatusId IN (0, 100, 200, 400, 900, 1000) /* Inactive, Pending, Active, Paused, PastDue, Presales */
+        AND os.ExpirationDate > (@now AT TIME ZONE pp.Timezone)
+    GROUP BY pp.PersonId, pp.ParkId, os.Id;
+
+    CREATE CLUSTERED INDEX IX_otherSubs ON #otherSubs (PersonId, ParkId, OtherSubscriptionId);
+
+    -- [OPT] BrandSettings subquery below was correlated on b.Id (brand) and re-ran fresh for
+    -- every output row sharing that brand. Pre-computed once per brand here instead.
+    SELECT DISTINCT
+        b.Id AS BrandId,
+        s.Id AS SettingId,
+        ISNULL(bs.Value, s.DefaultValue) AS Value
+    INTO #brandSettings
+    FROM dbo.Brands b
+    CROSS JOIN dbo.Settings s
+    LEFT JOIN dbo.BrandSettings bs
+        ON bs.BrandId = b.Id
+        AND bs.SettingId = s.Id;
+
+    CREATE CLUSTERED INDEX IX_brandSettings_BrandId ON #brandSettings (BrandId, SettingId);
+
+    -- [OPT] ClassificationEventTypes subquery below was correlated on fs.EventTypeId and re-ran
+    -- fresh for every output row sharing that event type (e.g. recurring events). Pre-computed once per type here.
+    SELECT
+        cet.EventTypeId,
+        cet.ClassificationId
+    INTO #eventTypeClassifications
+    FROM events.ClassificationEventTypes cet;
+
+    CREATE CLUSTERED INDEX IX_eventTypeClassifications_EventTypeId ON #eventTypeClassifications (EventTypeId, ClassificationId);
+
+    SELECT CONVERT(NVARCHAR(MAX), (
+        SELECT
+            fsd.Id [FranchiseScheduleDetail.Id],
+            fsd.StartDate [FranchiseScheduleDetail.StartDate],
+            fsd.EndDate [FranchiseScheduleDetail.EndDate],
+            fsd.DayMask [FranchiseScheduleDetail.DayMask],
+            fsd.StartTime [FranchiseScheduleDetail.StartTime],
+            fsd.EndTime [FranchiseScheduleDetail.EndTime],
+            fs.Name [FranchiseScheduleDetail.FranchiseSchedule.Name],
+            fs.Id [FranchiseScheduleDetail.FranchiseSchedule.Id],
+            fs.EventTypeId [FranchiseScheduleDetail.FranchiseSchedule.EventTypeId],
+            et.Name [FranchiseScheduleDetail.FranchiseSchedule.EventType.Name],
+            (
+                SELECT etc.ClassificationId
+                FROM #eventTypeClassifications etc  -- [OPT] now reads the precomputed temp table
+                WHERE etc.EventTypeId = fs.EventTypeId
+                FOR JSON PATH
+            ) [FranchiseScheduleDetail.FranchiseSchedule.EventType.ClassificationEventTypes],
+            l.Name [FranchiseScheduleDetail.FranchiseSchedule.Location.Name],
+            b.Name [FranchiseScheduleDetail.FranchiseSchedule.Park.Brand.Name],
+            b.UrlSlug [FranchiseScheduleDetail.FranchiseSchedule.Park.Brand.UrlSlug],
+            b.Id [FranchiseScheduleDetail.FranchiseSchedule.Park.Brand.Id],
+            (
+                SELECT
+                    bset.SettingId,
+                    bset.Value
+                FROM #brandSettings bset  -- [OPT] now reads the precomputed temp table
+                WHERE bset.BrandId = b.Id
+                FOR JSON PATH
+            ) [FranchiseScheduleDetail.FranchiseSchedule.Park.Brand.BrandSettings],
+            p.Id [FranchiseScheduleDetail.FranchiseSchedule.Park.Id],
+            p.Name [FranchiseScheduleDetail.FranchiseSchedule.Park.Name],
+            p.Permission [FranchiseScheduleDetail.FranchiseSchedule.Park.Permission],
+            p.Timezone [FranchiseScheduleDetail.FranchiseSchedule.Park.Timezone],
+            (
+                SELECT
+                    x.ExclusionTypeId,
+                    x.ExclusionDate
+                FROM events.FranchiseScheduleExclusions x
+                WHERE fsd.Id = x.FranchiseScheduleDetailId
+                    AND x.Deleted IS NULL
+                FOR JSON PATH
+            ) [FranchiseScheduleDetail.Exclusions],
+            per.Id [Subscription.Person.Id],
+            ISNULL(per.FirstName, 'Unassigned') [Subscription.Person.FirstName],
+            per.LastName [Subscription.Person.LastName],
+            (
+                SELECT osub.OtherSubscriptionId AS Id
+                FROM #otherSubs osub
+                WHERE osub.PersonId = per.Id
+                    AND osub.ParkId = p.Id
+                    AND osub.OtherSubscriptionId <> s.Id
+                FOR JSON PATH
+            ) [Subscription.Person.Subscriptions],
+            i.Location [Subscription.Person.PersonImage.Image.Location],
+            awp.AccountWaiverId [Subscription.Person.AccountWaiverParty.AccountWaiver.Id],
+            pt.ProductTypeId [Subscription.ParkProduct.ProductTemplate.ProductTypeId],
+            s.SubscriptionStatusId [Subscription.SubscriptionStatusId],
+            s.ExpirationDate [Subscription.ExpirationDate],
+            pa.Attended [Subscription.PersonAttendance.Attended],
+            er.FromDate,
+            er.ToDate,
+
+
+            (er.Canceled AT TIME ZONE p.Timezone) Canceled,
+            er.Id,
+            er.EventReservationTypeId,
+            (
+                SELECT ere.Date
+                FROM events.EventReservationExclusions ere
+                WHERE ere.EventReservationId = er.Id
+                    AND ere.Deleted IS NULL
+                FOR JSON PATH
+            ) EventReservationExclusions
+        FROM events.EventReservations er
+        JOIN events.FranchiseScheduleDetails fsd
+            ON fsd.Id = er.FranchiseScheduleDetailId
+        JOIN acct.Subscription s
+            ON er.SubscriptionId = s.Id
+        LEFT JOIN prdct.ParkProduct pp
+            ON s.ProductId = pp.Id
+        LEFT JOIN prdct.ProductTemplate pt
+            ON pp.ProductTemplateId = pt.Id
+        JOIN events.FranchiseSchedules fs
+            ON fsd.FranchiseScheduleId = fs.Id
+        JOIN park.Park p
+            ON fs.ParkId = p.Id
+        JOIN dbo.Brands b
+            ON p.BrandId = b.Id
+        LEFT JOIN events.Locations l
+            ON fs.LocationId = l.Id
+        LEFT JOIN acct.Person per
+            ON s.PersonId = per.Id
+        LEFT JOIN acct.PersonImage pi
+            ON per.Id = pi.PersonId
+            AND pi.IsActive = 1
+            AND pi.PersonImageTypeId = 1 /* Subscription */
+        LEFT JOIN media.Image i
+            ON pi.ImageId = i.Id
+        LEFT JOIN events.EventTypes et
+            ON fs.EventTypeId = et.Id
+        LEFT JOIN acct.AccountWaiver aw
+            ON s.AccountId = aw.AccountId
+                AND aw.ParkId = p.Id
+                AND aw.ExpirationDate > @now
+        LEFT JOIN acct.AccountWaiverParty awp
+            ON aw.Id = awp.AccountWaiverId
+                AND awp.PersonId = per.Id
+                AND awp.WaiverPartyTypeId = 200 /* CoveredPerson */
+        LEFT JOIN acct.PersonAttendance pa
+            ON s.Id = pa.SubscriptionId
+                AND er.Id = pa.EventReservationId
+                AND (pa.Attended BETWEEN @fromDate AND @toDate OR pa.Attended IS NULL)
+        WHERE s.AccountId = @accountId
+            AND (per.Id = @personId OR @personId IS NULL)
+            AND (@fromDate BETWEEN fsd.StartDate AND ISNULL(fsd.EndDate, fsd.StartDate)
+                OR @toDate BETWEEN fsd.StartDate AND ISNULL(fsd.EndDate, fsd.StartDate)
+                OR (@fromDate <= fsd.StartDate AND @toDate >= ISNULL(fsd.EndDate, fsd.StartDate)))
+            AND fsd.Canceled IS NULL
+            AND fsd.Deleted IS NULL
+            AND fs.Deleted IS NULL
+            AND fs.IsActive = 1
+            AND (@onlyActivePending = 0 OR SubscriptionStatusId IN ( 100, 200, 301, 1000 )) /* Pending, Active, Used, Presale */
+            AND (@onlyActivePending = 0 OR (s.ExpirationDate > (@now AT TIME ZONE p.Timezone)
+            AND s.ExpirationDate > @fromDate))
+            AND (@onlyActivePending = 0 OR er.Canceled IS NULL OR (er.EventReservationTypeId = 1 AND fsd.EndDate IS NOT NULL AND CONVERT(DATE, er.Canceled) > @fromDate)) /* Only check if series */
+        FOR JSON PATH
+    )) DATA
+END
+GO
